@@ -1,0 +1,960 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+_self="$(readlink -f "$0")"
+_self_dir="$(dirname "$_self")"
+if [ -d "${_self_dir}/../share/nixbox" ]; then
+    NIXBOX_SRC="${_self_dir}/../share/nixbox"
+else
+    NIXBOX_SRC="$(cd "${_self_dir}/.." && pwd)"
+fi
+ACTIVE_FILE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nixbox-active"
+NIXBOX_DIR=""
+
+TAP_DEV="vmtap0"
+TAP_HOST_IP="172.16.0.1"
+TAP_GUEST_IP="172.16.0.2"
+TAP_CIDR="172.16.0.1/30"
+SSH_KEY=""
+SSH_OPTS=()
+VM_USER="$(whoami)"
+
+die() { printf '\r%s\n' "ERROR: $*" >&2; exit 1; }
+log() { printf '\r%s\n' "$*"; }
+log_sub() { printf '\r    %s\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# Config resolution
+# ---------------------------------------------------------------------------
+
+find_nixbox_dir() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -f "$dir/.nixbox/config.nix" ]; then
+            echo "$dir/.nixbox"
+            return
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+init_nixbox_dir() {
+    if ! NIXBOX_DIR="$(find_nixbox_dir)"; then
+        die "No .nixbox/ found (searched from $PWD to /). Run 'nixbox init' first."
+    fi
+    SSH_KEY="$NIXBOX_DIR/ssh/vm_key"
+    SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i "$SSH_KEY")
+}
+
+init_nixbox_dir_or_active() {
+    if NIXBOX_DIR="$(find_nixbox_dir 2>/dev/null)"; then
+        :
+    elif [ -f "$ACTIVE_FILE" ]; then
+        NIXBOX_DIR="$(cat "$ACTIVE_FILE")"
+    else
+        die "No .nixbox/ found and no active VM."
+    fi
+    SSH_KEY="$NIXBOX_DIR/ssh/vm_key"
+    SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i "$SSH_KEY")
+}
+
+resolve_config() {
+    local config_path
+    config_path="$(realpath "$1")"
+    CONFIG_JSON=$(nix eval --json --impure \
+        --expr "(import ${NIXBOX_SRC}/lib/resolve.nix { configPath = ${config_path}; pluginsDir = ${NIXBOX_SRC}/plugins; })") \
+        || die "Failed to evaluate config: $config_path"
+}
+
+jq_field() { echo "$CONFIG_JSON" | jq -r "$1"; }
+
+run_hooks() {
+    local event="$1"
+    local hooks
+    hooks=$(echo "$CONFIG_JSON" | jq -r ".hooks.\"$event\"[]" 2>/dev/null) || return 0
+    [ -z "$hooks" ] && return 0
+    log "==> Running $event hooks..."
+    while IFS= read -r hook; do
+        [ -z "$hook" ] && continue
+        log_sub "hook: $hook"
+        (cd "$(dirname "$NIXBOX_DIR")" && sh -c "$hook") || log_sub "WARNING: $event hook failed: $hook"
+    done <<< "$hooks"
+}
+
+get_project_name() {
+    if [ -f "$NIXBOX_DIR/state/name" ]; then
+        cat "$NIXBOX_DIR/state/name"
+    else
+        basename "$(dirname "$NIXBOX_DIR")"
+    fi
+}
+
+check_no_conflicting_vm() {
+    if [ -f "$ACTIVE_FILE" ]; then
+        local active_nixbox_dir
+        active_nixbox_dir=$(cat "$ACTIVE_FILE")
+        if [ "$active_nixbox_dir" != "$NIXBOX_DIR" ]; then
+            local pid_file="${active_nixbox_dir}/state/pid"
+            if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                local active_name
+                active_name=$(basename "$(dirname "$active_nixbox_dir")")
+                die "VM for '${active_name}' ($(dirname "$active_nixbox_dir")) is running. Run 'nixbox down' there first."
+            fi
+            rm -f "$ACTIVE_FILE"
+        fi
+    fi
+}
+
+parse_mount_spec() {
+    MOUNT_SOURCE="" MOUNT_TARGET="" MOUNT_READONLY=""
+    local spec="$1"
+    [ -z "$spec" ] && return
+    IFS=',' read -ra PARTS <<< "$spec"
+    for part in "${PARTS[@]}"; do
+        case "$part" in
+            type=bind) ;;
+            source=*) MOUNT_SOURCE="${part#source=}" ;;
+            target=*) MOUNT_TARGET="${part#target=}" ;;
+            readonly)  MOUNT_READONLY="1" ;;
+            *) die "Unknown mount option: $part" ;;
+        esac
+    done
+    MOUNT_SOURCE="${MOUNT_SOURCE/#\~/$HOME}"
+    if [ -z "$MOUNT_SOURCE" ] || [ -z "$MOUNT_TARGET" ]; then
+        die "Mount spec requires source and target"
+    fi
+    if [ ! -d "$MOUNT_SOURCE" ]; then
+        die "Source directory does not exist: $MOUNT_SOURCE"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Internal VM operations
+# ---------------------------------------------------------------------------
+
+do_destroy() {
+    local name="$1"
+    local state_dir="$NIXBOX_DIR/state"
+    local run_dir="$NIXBOX_DIR/run"
+
+    if [ ! -d "$state_dir" ]; then
+        echo "VM '$name' not found. Nothing to do."
+        return 0
+    fi
+
+    if [ -f "$state_dir/pid" ]; then
+        local pid
+        pid=$(cat "$state_dir/pid")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "==> Requesting graceful shutdown..."
+            ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "sudo poweroff" 2>/dev/null || true
+
+            for _ in $(seq 1 10); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+            done
+
+            if kill -0 "$pid" 2>/dev/null; then
+                log "==> Sending SIGTERM..."
+                kill "$pid" 2>/dev/null || true
+                for _ in $(seq 1 5); do
+                    kill -0 "$pid" 2>/dev/null || break
+                    sleep 1
+                done
+            fi
+
+            if kill -0 "$pid" 2>/dev/null; then
+                log "==> Sending SIGKILL..."
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    for pidfile in "$state_dir"/virtiofsd_*_pid; do
+        [ -f "$pidfile" ] || continue
+        kill "$(cat "$pidfile")" 2>/dev/null || true
+    done
+
+    sudo nft delete table inet nixbox 2>/dev/null || true
+    if sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+        sudo iptables -D DOCKER-USER -i vmtap0 -j ACCEPT 2>/dev/null || true
+        sudo iptables -D DOCKER-USER -o vmtap0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    fi
+
+    if [ -f "$state_dir/dnsmasq.pid" ]; then
+        sudo kill "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null || true
+    fi
+
+    sudo ip link del "$TAP_DEV" 2>/dev/null || true
+
+    rm -f "$run_dir/env.img" "$run_dir/api.sock" "$run_dir/microvm-run"
+    rm -f "$run_dir"/virtiofs-*.sock
+
+    sudo rm -rf "$state_dir"
+
+    log "==> VM '$name' destroyed."
+}
+
+do_create() {
+    local name="$1"
+    local mounts_json="$2"
+    local domains_file="${3:-}"
+    local project_dir="${4:-}"
+    local state_dir="$NIXBOX_DIR/state"
+    local run_dir="$NIXBOX_DIR/run"
+
+    local runner="$NIXBOX_DIR/runner"
+    [ -d "$runner" ] || die "VM runner not found. Run 'nixbox build' first."
+
+    # Read config from resolved JSON (set by cmd_up → resolve_config)
+    local network vcpus mem_mb
+    network=$(jq_field '.network.mode')
+    vcpus=$(jq_field '.resources.vcpus')
+    [ "$vcpus" -eq 0 ] && vcpus=$(nproc)
+    mem_mb=$(jq_field '.resources.memoryMB')
+    if [ "$mem_mb" -eq 0 ]; then
+        mem_mb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 2 / 1024 ))
+        [ "$mem_mb" -lt 4096 ] && mem_mb=4096
+    fi
+    local allowed_ports
+    allowed_ports=$(echo "$CONFIG_JSON" | jq -r '.network.ports | join(",")')
+
+    # Guard: already running?
+    if [ -d "$state_dir" ] && [ -f "$state_dir/pid" ]; then
+        local pid
+        pid=$(cat "$state_dir/pid")
+        if kill -0 "$pid" 2>/dev/null; then
+            die "VM '$name' is already running (PID $pid)"
+        fi
+    fi
+
+    _CLEANUP_VM_NAME="$name"
+    cleanup_on_failure() {
+        log "==> Cleaning up after failure..."
+        do_destroy "$_CLEANUP_VM_NAME" 2>/dev/null || true
+    }
+    trap cleanup_on_failure EXIT
+
+    mkdir -p "$state_dir" "$run_dir"
+
+    # --- Generate env disk ---
+    log "==> Generating env disk..."
+    local env_dir="$NIXBOX_DIR/tmp/env-$$"
+    local env_img="$run_dir/env.img"
+    mkdir -p "$env_dir"
+
+    # Environment file
+    local env_json
+    env_json=$(echo "$CONFIG_JSON" | jq -r '.env // {}')
+    if [ "$(echo "$env_json" | jq 'length')" -gt 0 ]; then
+        echo "$env_json" | jq -r 'to_entries[] | "\(.key)=\(.value)"' > "$env_dir/env"
+    fi
+
+    mke2fs -F -t ext4 -d "$env_dir" -L env "$env_img" 32M 2>/dev/null
+    rm -rf "$env_dir"
+
+    # --- Create TAP device ---
+    log "==> Configuring network..."
+    sudo ip tuntap add dev "$TAP_DEV" mode tap multi_queue user "$(whoami)"
+    sudo ip addr add "$TAP_CIDR" dev "$TAP_DEV"
+    sudo ip link set "$TAP_DEV" up
+
+    # --- Network mode ---
+    case "$network" in
+        off)
+            log_sub "Mode: strict (no forwarding)"
+            sudo nft -f - <<'NFTEOF'
+table inet nixbox {
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+    chain postrouting {
+        type nat hook postrouting priority 100;
+        oifname != "vmtap0" ip saddr 172.16.0.0/30 masquerade
+    }
+}
+NFTEOF
+            ;;
+        filtered)
+            log_sub "Mode: filtered (domain allowlist)"
+            local dnsmasq_args=(
+                --no-resolv --no-hosts --bind-interfaces
+                "--listen-address=$TAP_HOST_IP"
+                --except-interface=lo
+                --keep-in-foreground
+            )
+            while IFS= read -r domain; do
+                [ -z "$domain" ] && continue
+                domain="${domain#\*.}"
+                dnsmasq_args+=("--server=/$domain/127.0.0.53")
+            done < "$domains_file"
+            sudo dnsmasq "${dnsmasq_args[@]}" &
+            echo $! > "$state_dir/dnsmasq.pid"
+
+            local ports_rule=""
+            [ -n "$allowed_ports" ] && \
+                ports_rule="iifname \"vmtap0\" tcp dport { $allowed_ports } accept"
+            sudo nft -f - <<NFTEOF
+table inet nixbox {
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        ct state established,related accept
+        iifname "vmtap0" udp dport 53 ip daddr $TAP_HOST_IP accept
+        iifname "vmtap0" tcp dport 53 ip daddr $TAP_HOST_IP accept
+        $ports_rule
+    }
+    chain postrouting {
+        type nat hook postrouting priority 100;
+        oifname != "vmtap0" ip saddr 172.16.0.0/30 masquerade
+    }
+}
+NFTEOF
+            sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+            # Docker's iptables FORWARD chain (policy DROP) intercepts forwarded
+            # packets. Add ACCEPT rules in DOCKER-USER so they're not dropped.
+            if sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+                sudo iptables -I DOCKER-USER -i vmtap0 -j ACCEPT
+                sudo iptables -I DOCKER-USER -o vmtap0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            fi
+            ;;
+        open)
+            log_sub "Mode: open (all traffic forwarded)"
+            sudo dnsmasq \
+                --no-resolv --no-hosts --bind-interfaces \
+                "--listen-address=$TAP_HOST_IP" \
+                --except-interface=lo \
+                --keep-in-foreground \
+                --server=127.0.0.53 &
+            echo $! > "$state_dir/dnsmasq.pid"
+            sudo nft -f - <<'NFTEOF'
+table inet nixbox {
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+    }
+    chain postrouting {
+        type nat hook postrouting priority 100;
+        oifname != "vmtap0" ip saddr 172.16.0.0/30 masquerade
+    }
+}
+NFTEOF
+            sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+            if sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+                sudo iptables -I DOCKER-USER -i vmtap0 -j ACCEPT
+                sudo iptables -I DOCKER-USER -o vmtap0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            fi
+            ;;
+        *)
+            die "Unknown network mode: $network"
+            ;;
+    esac
+
+    # --- Start virtiofsd for nix-store share (required by microvm config) ---
+    log "==> Starting virtiofsd for nix-store..."
+    local nix_store_sock="$run_dir/nixbox-virtiofs-nix-store.sock"
+    virtiofsd --socket-path="$nix_store_sock" --shared-dir="/nix/store" --sandbox=none --translate-uid="map:1000:$(id -u):1" --translate-gid="map:100:$(id -g):1" --cache=auto 2>"$run_dir/virtiofsd-nix-store.log" &
+    echo "$!" > "$state_dir/virtiofsd_nix_store_pid"
+    for _ in $(seq 1 10); do [ -S "$nix_store_sock" ] && break; sleep 0.2; done
+    [ -S "$nix_store_sock" ] || die "virtiofsd socket for nix-store did not appear"
+
+    # --- Start virtiofsd for each user mount ---
+    local mount_count
+    mount_count=$(echo "$mounts_json" | jq 'length')
+    if [ "$mount_count" -gt 0 ]; then
+        log "==> Starting virtiofsd for $mount_count mount(s)..."
+        for i in $(seq 0 $((mount_count - 1))); do
+            local src
+            src=$(echo "$mounts_json" | jq -r ".[$i].source")
+            src="${src/#\~/$HOME}"
+            [[ "$src" != /* ]] && src="$(realpath "${project_dir}/${src}")"
+            [ ! -d "$src" ] && die "Mount source does not exist: $src"
+
+            local virtiofs_sock="$run_dir/virtiofs-${i}.sock"
+            virtiofsd --socket-path="$virtiofs_sock" --shared-dir="$src" --sandbox=none --translate-uid="map:1000:$(id -u):1" --translate-gid="map:100:$(id -g):1" --cache=auto 2>"$run_dir/virtiofsd-${i}.log" &
+            echo "$!" > "$state_dir/virtiofsd_${i}_pid"
+            for _ in $(seq 1 10); do [ -S "$virtiofs_sock" ] && break; sleep 0.2; done
+            [ -S "$virtiofs_sock" ] || die "virtiofsd socket did not appear for mount $i"
+        done
+    fi
+
+    # --- Boot VM (patched runner for vCPU/RAM) ---
+    log "==> Booting VM '$name'..."
+
+    rm -f "$run_dir/api.sock"
+
+    cp "$runner/bin/microvm-run" "$run_dir/microvm-run"
+    chmod +x "$run_dir/microvm-run"
+    sed -i "s/--cpus boot=[0-9]*/--cpus boot=$vcpus/" "$run_dir/microvm-run"
+    sed -i "s/--memory size=[0-9]*M/--memory size=${mem_mb}M/" "$run_dir/microvm-run"
+    sed -i "s/num_queues=512/num_queues=$((vcpus * 2))/" "$run_dir/microvm-run"
+    sed -i "s/num_queues=256/num_queues=$((vcpus * 2))/" "$run_dir/microvm-run"
+
+    cd "$run_dir"
+    ulimit -n 65536
+    "$run_dir/microvm-run" >> "$run_dir/vm.log" 2>&1 &
+    local vm_pid=$!
+    echo "$vm_pid" > "$state_dir/pid"
+    echo "$name" > "$state_dir/name"
+    date +%s > "$state_dir/start_time"
+
+    # --- Wait for API socket ---
+    log "==> Waiting for cloud-hypervisor API..."
+    local api_sock="$run_dir/api.sock"
+    for _ in $(seq 1 30); do
+        [ -S "$api_sock" ] && break
+        sleep 1
+    done
+    if [ ! -S "$api_sock" ]; then
+        die "API socket did not appear after 30s"
+    fi
+
+    # Wait for API to actually respond
+    for _ in $(seq 1 30); do
+        if curl -s --max-time 2 --unix-socket "$api_sock" "http://localhost/api/v1/vm.info" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
+    # Check VM is still alive
+    if ! kill -0 "$vm_pid" 2>/dev/null; then
+        log "==> VM process died. Log tail:" >&2
+        tail -20 "$run_dir/vm.log" >&2
+        die "VM crashed before API became ready"
+    fi
+
+    # --- Hot-plug env disk ---
+    log "==> Hot-plugging env disk..."
+    local env_img_abs
+    env_img_abs=$(realpath "$run_dir/env.img")
+    local disk_response
+    disk_response=$(curl -s --max-time 30 --unix-socket "$api_sock" -X PUT \
+        "http://localhost/api/v1/vm.add-disk" \
+        -H "Content-Type: application/json" \
+        -d "{\"path\": \"$env_img_abs\", \"readonly\": true, \"id\": \"env-disk\"}" 2>&1) \
+        || die "env disk hot-plug curl failed (exit $?): $disk_response"
+    [ -n "$disk_response" ] && log_sub "env-disk: $disk_response"
+
+    # --- Hot-plug virtiofs for each mount ---
+    if [ "$mount_count" -gt 0 ]; then
+        for i in $(seq 0 $((mount_count - 1))); do
+            local virtiofs_sock_abs
+            virtiofs_sock_abs=$(realpath "$run_dir/virtiofs-${i}.sock")
+            curl -s --unix-socket "$api_sock" -X PUT \
+                "http://localhost/api/v1/vm.add-fs" \
+                -H "Content-Type: application/json" \
+                -d "{\"tag\": \"mount-$i\", \"socket\": \"$virtiofs_sock_abs\", \"num_queues\": 1, \"queue_size\": 1024, \"id\": \"mount-$i\"}"
+        done
+        echo ""
+    fi
+
+    # --- Wait for SSH ---
+    log "==> Waiting for SSH readiness..."
+    for _ in $(seq 1 60); do
+        if ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "true" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    if ! ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "true" 2>/dev/null; then
+        die "SSH not ready after 60s"
+    fi
+
+    # --- Mount virtiofs inside guest ---
+    if [ "$mount_count" -gt 0 ]; then
+        for i in $(seq 0 $((mount_count - 1))); do
+            local tgt ro src
+            tgt=$(echo "$mounts_json" | jq -r ".[$i].target")
+            tgt="${tgt/#\~//home/${VM_USER}}"
+            ro=$(echo "$mounts_json" | jq -r ".[$i].readonly")
+            src=$(echo "$mounts_json" | jq -r ".[$i].source")
+            src="${src/#\~/$HOME}"
+            [[ "$src" != /* ]] && src="$(realpath "${project_dir}/${src}")"
+
+            local ro_flag=""
+            [ "$ro" = "true" ] && ro_flag="-o ro"
+            ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" \
+                "sudo mkdir -p '$tgt' && sudo mount -t virtiofs $ro_flag mount-$i '$tgt' && sudo chown ${VM_USER}:users '$tgt' 2>/dev/null || true"
+            log_sub "Mounted $src → $tgt"
+
+            local ro_val=0; [ "$ro" = "true" ] && ro_val=1
+            echo "$i|$src|$tgt|$ro_val" > "$state_dir/mount_$i"
+        done
+
+    fi
+
+    # --- Run user scripts ---
+    local scripts_json
+    scripts_json=$(echo "$CONFIG_JSON" | jq -r '.scripts // []')
+    local script_count
+    script_count=$(echo "$scripts_json" | jq 'length')
+    if [ "$script_count" -gt 0 ]; then
+        log "==> Running setup scripts..."
+        for i in $(seq 0 $((script_count - 1))); do
+            local script_path
+            script_path=$(echo "$scripts_json" | jq -r ".[$i]")
+            [[ "$script_path" != /* ]] && script_path="$(realpath "${project_dir}/${script_path}")"
+            [ ! -f "$script_path" ] && { log_sub "WARNING: script not found: $script_path"; continue; }
+            local script_name
+            script_name=$(basename "$script_path")
+            scp -q "${SSH_OPTS[@]}" "$script_path" "${VM_USER}@$TAP_GUEST_IP:/tmp/$script_name"
+            ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "chmod +x /tmp/$script_name && /tmp/$script_name && rm /tmp/$script_name"
+            log_sub "Ran $script_path"
+        done
+    fi
+
+    # --- Connectivity check (skip for off) ---
+    if [ "$network" != "off" ]; then
+        log "==> Connectivity check..."
+        if ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "curl -sf --max-time 5 https://cache.nixos.org >/dev/null 2>&1"; then
+            log_sub "Nix cache: OK"
+        else
+            log_sub "WARNING: Nix cache unreachable"
+        fi
+    fi
+
+    trap - EXIT
+    log "==> VM '$name' is ready. Use 'nixbox shell' to connect."
+}
+
+do_ssh() {
+    local name="$1"
+    shift
+    local cmd="${*:-}"
+    local state_dir="$NIXBOX_DIR/state"
+
+    [ ! -d "$state_dir" ] && die "VM '$name' not found"
+
+    if [ -z "$cmd" ]; then
+        exec ssh -t "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP"
+    else
+        local escaped_cmd="${cmd//\'/\'\\\'\'}"
+        ssh -tt "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" -- "bash -lc '${escaped_cmd}'"
+    fi
+}
+
+do_mount() {
+    local name="$1"
+    local spec="$2"
+    local state_dir="$NIXBOX_DIR/state"
+    local run_dir="$NIXBOX_DIR/run"
+    local api_sock="$run_dir/api.sock"
+
+    [ ! -d "$state_dir" ] && die "VM '$name' not found"
+
+    parse_mount_spec "$spec"
+
+    # Find next mount index
+    local mount_idx=0
+    while [ -f "$state_dir/mount_$mount_idx" ]; do
+        mount_idx=$((mount_idx + 1))
+    done
+
+    local virtiofs_sock="$run_dir/virtiofs-${mount_idx}.sock"
+    virtiofsd \
+        --socket-path="$virtiofs_sock" \
+        --shared-dir="$MOUNT_SOURCE" \
+        --sandbox=none \
+        --translate-uid="map:1000:$(id -u):1" \
+        --translate-gid="map:100:$(id -g):1" \
+        --cache=auto 2>"$run_dir/virtiofsd-${mount_idx}.log" &
+    echo "$!" > "$state_dir/virtiofsd_${mount_idx}_pid"
+
+    for _ in $(seq 1 10); do
+        [ -S "$virtiofs_sock" ] && break
+        sleep 0.2
+    done
+
+    local virtiofs_sock_abs
+    virtiofs_sock_abs=$(realpath "$virtiofs_sock")
+    curl -s --unix-socket "$api_sock" -X PUT \
+        "http://localhost/api/v1/vm.add-fs" \
+        -H "Content-Type: application/json" \
+        -d "{\"tag\": \"mount-$mount_idx\", \"socket\": \"$virtiofs_sock_abs\", \"num_queues\": 1, \"queue_size\": 1024, \"id\": \"mount-$mount_idx\"}"
+    echo ""
+
+    MOUNT_TARGET="${MOUNT_TARGET/#\~//home/${VM_USER}}"
+    local ro_flag=""
+    [ -n "$MOUNT_READONLY" ] && ro_flag="-o ro"
+    ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" \
+        "sudo mkdir -p '$MOUNT_TARGET' && sudo mount -t virtiofs $ro_flag mount-$mount_idx '$MOUNT_TARGET' && sudo chown ${VM_USER}:users '$MOUNT_TARGET'"
+
+    echo "$mount_idx|$MOUNT_SOURCE|$MOUNT_TARGET|${MOUNT_READONLY:-0}" > "$state_dir/mount_$mount_idx"
+    log "==> Mounted $MOUNT_SOURCE at $MOUNT_TARGET on VM '$name'"
+}
+
+do_unmount() {
+    local name="$1"
+    local target="$2"
+    local state_dir="$NIXBOX_DIR/state"
+    local run_dir="$NIXBOX_DIR/run"
+    local api_sock="$run_dir/api.sock"
+
+    [ ! -d "$state_dir" ] && die "VM '$name' not found"
+
+    local mount_idx=""
+    for f in "$state_dir"/mount_*; do
+        [ -f "$f" ] || continue
+        local stored_target
+        stored_target=$(cut -d'|' -f3 < "$f")
+        if [ "$stored_target" = "$target" ]; then
+            mount_idx=$(basename "$f" | sed 's/mount_//')
+            break
+        fi
+    done
+
+    [ -z "$mount_idx" ] && die "No mount found for target '$target' on VM '$name'"
+
+    ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "sudo umount '$target'"
+
+    curl -s --unix-socket "$api_sock" -X PUT \
+        "http://localhost/api/v1/vm.remove-device" \
+        -H "Content-Type: application/json" \
+        -d "{\"id\": \"mount-$mount_idx\"}"
+    echo ""
+
+    if [ -f "$state_dir/virtiofsd_${mount_idx}_pid" ]; then
+        kill "$(cat "$state_dir/virtiofsd_${mount_idx}_pid")" 2>/dev/null || true
+        rm -f "$state_dir/virtiofsd_${mount_idx}_pid"
+    fi
+
+    rm -f "$state_dir/mount_$mount_idx"
+    rm -f "$run_dir/virtiofs-${mount_idx}.sock"
+
+    log "==> Unmounted $target from VM '$name'"
+}
+
+do_list() {
+    local nixbox_dir=""
+    if [ -f "$ACTIVE_FILE" ]; then
+        nixbox_dir="$(cat "$ACTIVE_FILE")"
+    elif nixbox_dir="$(find_nixbox_dir 2>/dev/null)"; then
+        :
+    fi
+
+    if [ -z "$nixbox_dir" ] || [ ! -d "$nixbox_dir/state" ] || [ ! -f "$nixbox_dir/state/pid" ]; then
+        echo "No VMs found."
+        return 0
+    fi
+
+    local state_dir="$nixbox_dir/state"
+
+    printf "%-15s %-10s %-12s %-10s\n" "NAME" "PID" "UPTIME" "STATUS"
+    printf "%-15s %-10s %-12s %-10s\n" "----" "---" "------" "------"
+
+    local name pid start status uptime
+    name=$(cat "$state_dir/name" 2>/dev/null || basename "$(dirname "$nixbox_dir")")
+    pid=$(cat "$state_dir/pid" 2>/dev/null || echo "-")
+    start=$(cat "$state_dir/start_time" 2>/dev/null || echo "0")
+
+    if [ "$pid" != "-" ] && kill -0 "$pid" 2>/dev/null; then
+        status="running"
+        local now uptime_secs hours mins
+        now=$(date +%s)
+        uptime_secs=$((now - start))
+        hours=$((uptime_secs / 3600))
+        mins=$(( (uptime_secs % 3600) / 60 ))
+        uptime="${hours}h${mins}m"
+    else
+        status="dead"
+        uptime="-"
+    fi
+
+    printf "%-15s %-10s %-12s %-10s\n" "$name" "$pid" "$uptime" "$status"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+ensure_setup() {
+    for cmd in nix jq dnsmasq nft mke2fs virtiofsd; do
+        command -v "$cmd" &>/dev/null || die "$cmd not found. Install it first."
+    done
+    [ -e /dev/kvm ] || die "/dev/kvm not found. KVM is required."
+    mkdir -p "$NIXBOX_DIR"/{ssh,state,run,tmp}
+    if [ ! -f "$SSH_KEY" ]; then
+        log "==> Generating SSH key pair..."
+        ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "nixbox"
+    fi
+}
+
+compute_build_hash() {
+    local config_path="$1"
+    (
+        cat "$NIXBOX_SRC/flake.nix" \
+            "$NIXBOX_SRC/flake.lock" \
+            "$NIXBOX_SRC/lib/resolve.nix" \
+            "$config_path" \
+            "$NIXBOX_DIR/ssh/vm_key.pub"
+        find "$NIXBOX_SRC/plugins" -name '*.nix' -exec cat {} + 2>/dev/null || true
+    ) | sha256sum | cut -d' ' -f1
+}
+
+ensure_build() {
+    local config_path="$1"
+    local hash_file="$NIXBOX_DIR/state/.build-hash"
+    local runner="$NIXBOX_DIR/runner"
+    local current_hash
+    current_hash="$(compute_build_hash "$config_path")"
+
+    # Fast path: runner exists and hash matches
+    if [ -d "$runner" ] && [ -f "$hash_file" ] && [ "$(cat "$hash_file")" = "$current_hash" ]; then
+        return 0
+    fi
+
+    log "==> Build needed (config or nixbox changed)..."
+    local ssh_pub="$NIXBOX_DIR/ssh/vm_key.pub"
+    local build_dir="$NIXBOX_DIR/build"
+    chmod -R u+w "$build_dir" 2>/dev/null || true
+    rm -rf "$build_dir"
+    mkdir -p "$build_dir/lib"
+
+    cp "$NIXBOX_SRC/flake.nix" "$build_dir/"
+    cp "$NIXBOX_SRC/flake.lock" "$build_dir/"
+    cp "$NIXBOX_SRC/lib/resolve.nix" "$build_dir/lib/"
+    cp -r "$NIXBOX_SRC/plugins" "$build_dir/"
+    cp "$config_path" "$build_dir/project-config.nix"
+    cp "$ssh_pub" "$build_dir/ssh_key.pub"
+    echo "{ username = \"$VM_USER\"; }" > "$build_dir/host-info.nix"
+
+    (cd "$build_dir" && git init -q && git add -A && git commit -q -m "build" --allow-empty)
+
+    log "==> Building VM runner..."
+    (cd "$build_dir" && nix build .#vm-runner)
+
+    ln -sfn "$(readlink -f "$build_dir/result")" "$runner"
+    echo "$current_hash" > "$hash_file"
+    log "==> Build complete."
+}
+
+cmd_setup() {
+    init_nixbox_dir
+    log "==> Checking prerequisites..."
+    ensure_setup
+    log "==> Setup complete."
+}
+
+cmd_init() {
+    [ -d .nixbox ] && die ".nixbox/ already exists in $PWD"
+    mkdir -p .nixbox
+    cp "${NIXBOX_SRC}/config.example.nix" .nixbox/config.nix
+    cat > .nixbox/.gitignore <<'EOF'
+*
+!.gitignore
+!config.nix
+EOF
+    echo "Created .nixbox/ in $PWD"
+    echo "Edit .nixbox/config.nix, then run 'nixbox up'."
+}
+
+cmd_build() {
+    init_nixbox_dir
+    local config_path="$NIXBOX_DIR/config.nix"
+    ensure_setup
+    [ "${1:-}" = "--force" ] || [ "${1:-}" = "-f" ] && rm -f "$NIXBOX_DIR/state/.build-hash"
+    ensure_build "$config_path"
+}
+
+cmd_up() {
+    init_nixbox_dir
+    local config_path="$NIXBOX_DIR/config.nix"
+    local project_dir
+    project_dir="$(dirname "$NIXBOX_DIR")"
+    ensure_setup
+    ensure_build "$config_path"
+    resolve_config "$config_path"
+
+    local project_name network
+    project_name="$(jq_field '.projectName')"
+    network="$(jq_field '.network.mode')"
+
+    local mounts_json
+    mounts_json=$(echo "$CONFIG_JSON" | jq -c '.mounts')
+
+    local domains_file=""
+    if [ "$network" = "filtered" ]; then
+        domains_file="$(mktemp)"
+        echo "$CONFIG_JSON" | jq -r '.network.domains[]' > "$domains_file"
+    fi
+
+    check_no_conflicting_vm
+
+    local vcpus mem_mb
+    vcpus="$(jq_field '.resources.vcpus')"
+    mem_mb="$(jq_field '.resources.memoryMB')"
+    log "==> Starting VM '$project_name' [network=$network, vcpus=$vcpus, mem=${mem_mb}MB]"
+
+    echo "$NIXBOX_DIR" > "$ACTIVE_FILE"
+
+    run_hooks "pre-up"
+    do_create "$project_name" "$mounts_json" "$domains_file" "$project_dir"
+    [ -n "$domains_file" ] && rm -f "$domains_file"
+    run_hooks "post-up"
+}
+
+cmd_down() {
+    init_nixbox_dir_or_active
+    local config_path="$NIXBOX_DIR/config.nix"
+    resolve_config "$config_path" 2>/dev/null || true
+    local project_name
+    project_name="$(get_project_name)"
+    run_hooks "pre-down"
+    do_destroy "$project_name"
+    rm -f "$ACTIVE_FILE"
+    run_hooks "post-down"
+}
+
+cmd_shell() {
+    init_nixbox_dir_or_active
+    local name
+    name="$(get_project_name)"
+    do_ssh "$name"
+}
+
+cmd_run() {
+    [ $# -eq 0 ] && die "Usage: nixbox run <command...>"
+    init_nixbox_dir_or_active
+    local name
+    name="$(get_project_name)"
+    do_ssh "$name" "$*"
+}
+
+cmd_mount() {
+    [ $# -lt 1 ] && die "Usage: nixbox mount <mount_spec>"
+    init_nixbox_dir_or_active
+    local name
+    name="$(get_project_name)"
+    do_mount "$name" "$1"
+}
+
+cmd_unmount() {
+    [ $# -lt 1 ] && die "Usage: nixbox unmount <target>"
+    init_nixbox_dir_or_active
+    local name
+    name="$(get_project_name)"
+    do_unmount "$name" "$1"
+}
+
+cmd_status() {
+    do_list
+    if [ -f "$ACTIVE_FILE" ]; then
+        echo ""
+        echo "Active workspace: $(dirname "$(cat "$ACTIVE_FILE")")"
+    fi
+}
+
+cmd_config() {
+    init_nixbox_dir
+    local cfg="$NIXBOX_DIR/config.nix"
+    resolve_config "$cfg"
+    echo "$CONFIG_JSON" | jq '.' | sed $'s/^/\r/'
+}
+
+cmd_doctor() {
+    local errors=0
+
+    log "==> Checking prerequisites..."
+    for cmd in nix jq dnsmasq nft mke2fs virtiofsd; do
+        if command -v "$cmd" &>/dev/null; then
+            log_sub "$cmd: OK"
+        else
+            log_sub "$cmd: MISSING"
+            errors=$((errors + 1))
+        fi
+    done
+
+    if [ -e /dev/kvm ]; then
+        log_sub "/dev/kvm: OK"
+    else
+        log_sub "/dev/kvm: MISSING"
+        errors=$((errors + 1))
+    fi
+
+    echo ""
+    log "==> Checking project config..."
+    if NIXBOX_DIR="$(find_nixbox_dir 2>/dev/null)"; then
+        SSH_KEY="$NIXBOX_DIR/ssh/vm_key"
+        SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i "$SSH_KEY")
+        local config_path="$NIXBOX_DIR/config.nix"
+        log_sub "config: $config_path"
+        if resolve_config "$config_path" 2>/dev/null; then
+            log_sub "Nix eval: OK"
+            log_sub "Network: $(jq_field '.network.mode')"
+            local mount_count
+            mount_count=$(echo "$CONFIG_JSON" | jq '.mounts | length')
+            log_sub "Mounts: $mount_count"
+            local aws_profile="${AWS_PROFILE:-}"
+            if [ -n "$aws_profile" ]; then
+                if aws sts get-caller-identity --profile "$aws_profile" &>/dev/null; then
+                    log_sub "AWS profile ($aws_profile): OK"
+                else
+                    log_sub "AWS profile ($aws_profile): NOT AUTHENTICATED (run 'nixbox aws login')"
+                fi
+            fi
+        else
+            log_sub "Nix eval: FAILED"
+            errors=$((errors + 1))
+        fi
+    else
+        log_sub "config: not found (run 'nixbox init')"
+    fi
+
+    echo ""
+    if [ $errors -gt 0 ]; then
+        die "$errors issue(s) found"
+    else
+        log "==> All checks passed."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+case "${1:-}" in
+    setup)       shift; cmd_setup "$@" ;;
+    init)        shift; cmd_init "$@" ;;
+    build)       shift; cmd_build "$@" ;;
+    up)          shift; cmd_up "$@" ;;
+    down)        shift; cmd_down "$@" ;;
+    shell)       shift; cmd_shell "$@" ;;
+    run)         shift; cmd_run "$@" ;;
+    mount)       shift; cmd_mount "$@" ;;
+    unmount)     shift; cmd_unmount "$@" ;;
+    status)      shift; cmd_status "$@" ;;
+    config)      shift; cmd_config "$@" ;;
+    doctor)      shift; cmd_doctor "$@" ;;
+    -h|--help|"")
+        cat <<'USAGE'
+Usage: nixbox <command> [args...]
+
+Commands:
+    init          Create .nixbox/ directory in cwd
+    up            Start VM (auto-setup + auto-build if needed)
+    down          Destroy VM for current project
+    shell         SSH into VM (interactive)
+    run <cmd>     Run command in VM (non-interactive)
+    mount <spec>  Hot-plug bind mount
+    unmount <tgt> Remove bind mount
+    status        Show running VM info
+    config        Print resolved project config
+    doctor        Check prerequisites and config
+    setup         Run one-time setup manually
+    build [-f]    Build VM runner manually (-f to force)
+
+Plugin commands:
+    <plugin> <cmd> [args...]    Run a plugin command (e.g. nixbox aws login)
+USAGE
+        ;;
+    *)
+        # Plugin command dispatch: nixbox <plugin> <command> [args...]
+        plugin_cmd_script="${NIXBOX_SRC}/plugins/${1}/commands/${2:-}.sh"
+        if [ -n "${2:-}" ] && [ -f "$plugin_cmd_script" ]; then
+            shift 2
+            exec bash "$plugin_cmd_script" "$@"
+        fi
+        die "Unknown command: $1. Run 'nixbox --help' for usage."
+        ;;
+esac
