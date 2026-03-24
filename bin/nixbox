@@ -2,22 +2,43 @@
 set -euo pipefail
 
 
-_self="$(readlink -f "$0")"
+_portable_realpath() {
+    local path="$1"
+    if command -v realpath &>/dev/null; then
+        realpath "$path"
+    elif command -v readlink &>/dev/null && readlink -f "$path" 2>/dev/null; then
+        :
+    else
+        # POSIX fallback
+        cd "$(dirname "$path")" && echo "$(pwd -P)/$(basename "$path")"
+    fi
+}
+_self="$(_portable_realpath "$0")"
 _self_dir="$(dirname "$_self")"
 if [ -d "${_self_dir}/../share/nixbox" ]; then
     NIXBOX_SRC="${_self_dir}/../share/nixbox"
 else
     NIXBOX_SRC="$(cd "${_self_dir}/.." && pwd)"
 fi
-NIXBOX_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nixbox"
-SLOTS_DIR="$NIXBOX_RUNTIME_DIR/slots"
-# shellcheck disable=SC2034  # used by lib/functions.bash
-BYDIR_DIR="$NIXBOX_RUNTIME_DIR/by-dir"
+
+NIXBOX_PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')"  # "linux" or "darwin"
+
+if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+    ACTIVE_FILE="${TMPDIR:-/tmp}/nixbox-active"
+    GUEST_IP=""  # discovered at runtime via ARP
+else
+    NIXBOX_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nixbox"
+    SLOTS_DIR="$NIXBOX_RUNTIME_DIR/slots"
+    # shellcheck disable=SC2034  # used by lib/functions.bash
+    BYDIR_DIR="$NIXBOX_RUNTIME_DIR/by-dir"
+fi
 NIXBOX_DIR=""
 
-# Network variables — set by derive_network() per VM slot
-# shellcheck disable=SC2034
-TAP_DEV="" TAP_HOST_IP="" TAP_GUEST_IP="" TAP_SUBNET="" TAP_CIDR="" TAP_MAC="" NFT_TABLE="" VSOCK_CID=""
+# Network variables — set by derive_network() per VM slot (Linux only)
+if [ "$NIXBOX_PLATFORM" != "darwin" ]; then
+    # shellcheck disable=SC2034
+    TAP_DEV="" TAP_HOST_IP="" TAP_GUEST_IP="" TAP_SUBNET="" TAP_CIDR="" TAP_MAC="" NFT_TABLE="" VSOCK_CID=""
+fi
 
 # shellcheck disable=SC2034
 SSH_KEY=""
@@ -42,16 +63,24 @@ do_destroy() {
         return 0
     fi
 
-    local vm_slot
-    vm_slot=$(cat "$state_dir/slot" 2>/dev/null || echo "0")
-    derive_network "$vm_slot" "$name"
+    if [ "$NIXBOX_PLATFORM" != "darwin" ]; then
+        local vm_slot
+        vm_slot=$(cat "$state_dir/slot" 2>/dev/null || echo "0")
+        derive_network "$vm_slot" "$name"
+    fi
 
     if [ -f "$state_dir/pid" ]; then
         local pid
         pid=$(cat "$state_dir/pid")
         if kill -0 "$pid" 2>/dev/null; then
             log "==> Requesting graceful shutdown..."
-            ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "sudo poweroff" 2>/dev/null || true
+            local target_ip
+            if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+                target_ip=$(cat "$state_dir/guest_ip" 2>/dev/null || echo "")
+            else
+                target_ip="$TAP_GUEST_IP"
+            fi
+            [ -n "$target_ip" ] && ssh "${SSH_OPTS[@]}" ${VM_USER}@"$target_ip" "sudo poweroff" 2>/dev/null || true
 
             for _ in $(seq 1 10); do
                 kill -0 "$pid" 2>/dev/null || break
@@ -74,27 +103,33 @@ do_destroy() {
         fi
     fi
 
-    for pidfile in "$state_dir"/virtiofsd_*_pid; do
-        [ -f "$pidfile" ] || continue
-        kill "$(cat "$pidfile")" 2>/dev/null || true
-    done
+    if [ "$NIXBOX_PLATFORM" != "darwin" ]; then
+        for pidfile in "$state_dir"/virtiofsd_*_pid; do
+            [ -f "$pidfile" ] || continue
+            kill "$(cat "$pidfile")" 2>/dev/null || true
+        done
 
-    sudo nft delete table inet $NFT_TABLE 2>/dev/null || true
-    if sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
-        sudo iptables -D DOCKER-USER -i $TAP_DEV -j ACCEPT 2>/dev/null || true
-        sudo iptables -D DOCKER-USER -o $TAP_DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        sudo nft delete table inet $NFT_TABLE 2>/dev/null || true
+        if sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+            sudo iptables -D DOCKER-USER -i $TAP_DEV -j ACCEPT 2>/dev/null || true
+            sudo iptables -D DOCKER-USER -o $TAP_DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        fi
+
+        if [ -f "$state_dir/dnsmasq.pid" ]; then
+            sudo kill "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null || true
+        fi
+
+        sudo ip link del "$TAP_DEV" 2>/dev/null || true
     fi
-
-    if [ -f "$state_dir/dnsmasq.pid" ]; then
-        sudo kill "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null || true
-    fi
-
-    sudo ip link del "$TAP_DEV" 2>/dev/null || true
 
     rm -f "$run_dir/env.img" "$run_dir/api.sock" "$run_dir/microvm-run"
     rm -f "$run_dir"/virtiofs-*.sock
 
-    sudo rm -rf "$state_dir"
+    if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+        rm -rf "$state_dir"
+    else
+        sudo rm -rf "$state_dir"
+    fi
 
     log "==> VM '$name' destroyed."
 }
@@ -114,10 +149,20 @@ do_create() {
     local network vcpus mem_mb
     network=$(jq_field '.network.mode')
     vcpus=$(jq_field '.resources.vcpus')
-    if [ "$vcpus" -eq 0 ]; then vcpus=$(( $(nproc) / 2 )); [ "$vcpus" -lt 1 ] && vcpus=1; fi
+    if [ "$vcpus" -eq 0 ]; then
+        if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+            vcpus=$(sysctl -n hw.logicalcpu)
+        else
+            vcpus=$(( $(nproc) / 2 )); [ "$vcpus" -lt 1 ] && vcpus=1
+        fi
+    fi
     mem_mb=$(jq_field '.resources.memoryMB')
     if [ "$mem_mb" -eq 0 ]; then
-        mem_mb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 2 / 1024 ))
+        if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+            mem_mb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 2 ))
+        else
+            mem_mb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 2 / 1024 ))
+        fi
         [ "$mem_mb" -lt 4096 ] && mem_mb=4096
     fi
     local allowed_ports
@@ -140,7 +185,9 @@ do_create() {
     trap cleanup_on_failure EXIT
 
     mkdir -p "$state_dir" "$run_dir"
-    echo "$VM_SLOT" > "$state_dir/slot"
+    if [ "$NIXBOX_PLATFORM" != "darwin" ]; then
+        echo "$VM_SLOT" > "$state_dir/slot"
+    fi
 
     # --- Generate env disk ---
     log "==> Generating env disk..."
@@ -158,27 +205,166 @@ do_create() {
     mke2fs -F -t ext4 -d "$env_dir" -L env "$env_img" 32M 2>/dev/null
     rm -rf "$env_dir"
 
-    # --- Create TAP device ---
-    # Use multi_queue only when vcpus > 2; cloud-hypervisor uses IFF_MULTI_QUEUE
-    # iff num_queues > 2, and opening a multi_queue TAP without IFF_MULTI_QUEUE fails.
-    log "==> Configuring network..."
-    local mq_flag=""
-    [ "$vcpus" -gt 2 ] && mq_flag="multi_queue"
-    # shellcheck disable=SC2086
-    sudo ip tuntap add dev "$TAP_DEV" mode tap $mq_flag user "$(whoami)"
-    sudo ip addr add "$TAP_CIDR" dev "$TAP_DEV"
-    sudo ip link set "$TAP_DEV" up
+    if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+        # --- Darwin boot flow (vfkit via vmnet NAT) ---
+        if [ "$network" != "open" ]; then
+            log "WARNING: Network mode '$network' not supported on macOS. Using open (vmnet NAT)."
+        fi
 
-    # Resolve real upstream DNS servers (avoids forwarding to stub 127.0.0.53)
-    local upstream
-    local -a upstream_dns
-    mapfile -t upstream_dns < <(get_upstream_dns_servers)
+        log "==> Booting VM '$name'..."
 
-    # --- Network mode ---
-    case "$network" in
-        off)
-            log_sub "Mode: strict (no forwarding)"
-            sudo nft -f - <<NFTEOF
+        cp "$runner/bin/microvm-run" "$run_dir/microvm-run"
+        chmod +x "$run_dir/microvm-run"
+
+        # Patch CPU/RAM in vfkit runner
+        sed -i '' "s/--cpus [0-9]*/--cpus $vcpus/" "$run_dir/microvm-run"
+        sed -i '' "s/--memory-size [0-9]*[mMgG]*/--memory-size ${mem_mb}/" "$run_dir/microvm-run"
+
+        # Append env disk and virtiofs mounts to the runner script
+        local extra_args=""
+        local env_img_abs
+        env_img_abs=$(realpath "$run_dir/env.img")
+        extra_args="--device virtio-blk,path=${env_img_abs}"
+
+        local mount_count
+        mount_count=$(echo "$mounts_json" | jq 'length')
+        if [ "$mount_count" -gt 0 ]; then
+            log "==> Configuring $mount_count virtiofs mount(s)..."
+            for i in $(seq 0 $((mount_count - 1))); do
+                local src
+                src=$(echo "$mounts_json" | jq -r ".[$i].source")
+                src="${src/#\~/$HOME}"
+                [[ "$src" != /* ]] && src="$(realpath "${project_dir}/${src}")"
+                [ ! -d "$src" ] && die "Mount source does not exist: $src"
+                extra_args="$extra_args --device virtio-fs,sharedDir=${src},mountTag=mount-${i}"
+            done
+        fi
+
+        # Patch runner: replace ${runtime_args:-} or append to exec line
+        if grep -q '${runtime_args:-}' "$run_dir/microvm-run" 2>/dev/null; then
+            sed -i '' "s|\${runtime_args:-}|${extra_args}|" "$run_dir/microvm-run"
+        else
+            # Append extra args to the last exec line
+            sed -i '' "s|^exec vfkit\(.*\)|exec vfkit\1 ${extra_args}|" "$run_dir/microvm-run"
+        fi
+
+        cd "$run_dir"
+        "$run_dir/microvm-run" >> "$run_dir/vm.log" 2>&1 &
+        local vm_pid=$!
+        echo "$vm_pid" > "$state_dir/pid"
+        echo "$name" > "$state_dir/name"
+        date +%s > "$state_dir/start_time"
+
+        # --- Discover guest IP via ARP ---
+        log "==> Discovering guest IP..."
+        GUEST_IP=""
+        for _ in $(seq 1 60); do
+            GUEST_IP=$(arp -an | grep -i '2:0:0:0:0:1\|02:00:00:00:00:01' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+            [ -n "$GUEST_IP" ] && break
+            if ! kill -0 "$vm_pid" 2>/dev/null; then
+                log "==> VM process died. Log tail:" >&2
+                tail -20 "$run_dir/vm.log" >&2
+                die "VM crashed before IP was discovered"
+            fi
+            sleep 1
+        done
+        [ -z "$GUEST_IP" ] && die "Could not discover guest IP after 60s"
+        echo "$GUEST_IP" > "$state_dir/guest_ip"
+        log_sub "Guest IP: $GUEST_IP"
+
+        # --- Wait for SSH ---
+        log "==> Waiting for SSH readiness..."
+        for _ in $(seq 1 60); do
+            if ssh "${SSH_OPTS[@]}" ${VM_USER}@"$GUEST_IP" "true" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        if ! ssh "${SSH_OPTS[@]}" ${VM_USER}@"$GUEST_IP" "true" 2>/dev/null; then
+            die "SSH not ready after 60s"
+        fi
+
+        # --- Inject VM SSH key for outbound connections (e.g. GitHub) ---
+        log "==> Injecting SSH identity..."
+        ssh "${SSH_OPTS[@]}" ${VM_USER}@"$GUEST_IP" "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+        scp -q "${SSH_OPTS[@]}" "$SSH_KEY" "${VM_USER}@${GUEST_IP}:~/.ssh/id_ed25519"
+        ssh "${SSH_OPTS[@]}" ${VM_USER}@"$GUEST_IP" "chmod 600 ~/.ssh/id_ed25519"
+        log_sub "SSH key: $(cat "${SSH_KEY}.pub")"
+
+        # --- Mount virtiofs inside guest ---
+        if [ "$mount_count" -gt 0 ]; then
+            for i in $(seq 0 $((mount_count - 1))); do
+                local tgt ro src
+                tgt=$(echo "$mounts_json" | jq -r ".[$i].target")
+                tgt="${tgt/#\~//home/${VM_USER}}"
+                ro=$(echo "$mounts_json" | jq -r ".[$i].readonly")
+                src=$(echo "$mounts_json" | jq -r ".[$i].source")
+                src="${src/#\~/$HOME}"
+                [[ "$src" != /* ]] && src="$(realpath "${project_dir}/${src}")"
+
+                local ro_flag=""
+                [ "$ro" = "true" ] && ro_flag="-o ro"
+                ssh "${SSH_OPTS[@]}" ${VM_USER}@"$GUEST_IP" \
+                    "sudo mkdir -p '$tgt' && sudo mount -t virtiofs $ro_flag mount-$i '$tgt' && sudo chown ${VM_USER}:users '$tgt' 2>/dev/null || true"
+                log_sub "Mounted $src → $tgt"
+
+                local ro_val=0; [ "$ro" = "true" ] && ro_val=1
+                echo "$i|$src|$tgt|$ro_val" > "$state_dir/mount_$i"
+            done
+        fi
+
+        # --- Run user scripts ---
+        local scripts_json
+        scripts_json=$(echo "$CONFIG_JSON" | jq -r '.scripts // []')
+        local script_count
+        script_count=$(echo "$scripts_json" | jq 'length')
+        if [ "$script_count" -gt 0 ]; then
+            log "==> Running setup scripts..."
+            for i in $(seq 0 $((script_count - 1))); do
+                local script_path
+                script_path=$(echo "$scripts_json" | jq -r ".[$i]")
+                [[ "$script_path" != /* ]] && script_path="$(realpath "${project_dir}/${script_path}")"
+                [ ! -f "$script_path" ] && { log_sub "WARNING: script not found: $script_path"; continue; }
+                local script_name
+                script_name=$(basename "$script_path")
+                scp -q "${SSH_OPTS[@]}" "$script_path" "${VM_USER}@$GUEST_IP:/tmp/$script_name"
+                ssh "${SSH_OPTS[@]}" ${VM_USER}@"$GUEST_IP" "chmod +x /tmp/$script_name && /tmp/$script_name && rm /tmp/$script_name"
+                log_sub "Ran $script_path"
+            done
+        fi
+
+        # --- Connectivity check ---
+        log "==> Connectivity check..."
+        if ssh "${SSH_OPTS[@]}" ${VM_USER}@"$GUEST_IP" "curl -sf --max-time 5 https://cache.nixos.org >/dev/null 2>&1"; then
+            log_sub "Nix cache: OK"
+        else
+            log_sub "WARNING: Nix cache unreachable"
+        fi
+
+    else
+        # --- Linux boot flow (cloud-hypervisor + TAP + nftables) ---
+
+        # --- Create TAP device ---
+        # Use multi_queue only when vcpus > 2; cloud-hypervisor uses IFF_MULTI_QUEUE
+        # iff num_queues > 2, and opening a multi_queue TAP without IFF_MULTI_QUEUE fails.
+        log "==> Configuring network..."
+        local mq_flag=""
+        [ "$vcpus" -gt 2 ] && mq_flag="multi_queue"
+        # shellcheck disable=SC2086
+        sudo ip tuntap add dev "$TAP_DEV" mode tap $mq_flag user "$(whoami)"
+        sudo ip addr add "$TAP_CIDR" dev "$TAP_DEV"
+        sudo ip link set "$TAP_DEV" up
+
+        # Resolve real upstream DNS servers (avoids forwarding to stub 127.0.0.53)
+        local upstream
+        local -a upstream_dns
+        mapfile -t upstream_dns < <(get_upstream_dns_servers)
+
+        # --- Network mode ---
+        case "$network" in
+            off)
+                log_sub "Mode: strict (no forwarding)"
+                sudo nft -f - <<NFTEOF
 table inet $NFT_TABLE {
     chain input {
         type filter hook input priority 0;
@@ -193,53 +379,53 @@ table inet $NFT_TABLE {
     }
 }
 NFTEOF
-            sudo dnsmasq --port=0 --bind-interfaces \
-                "--listen-address=$TAP_HOST_IP" \
-                --except-interface=lo \
-                --keep-in-foreground \
-                "--dhcp-range=$TAP_GUEST_IP,$TAP_GUEST_IP,infinite" \
-                "--dhcp-option=option:router,$TAP_HOST_IP" \
-                "--dhcp-option=option:dns-server,$TAP_HOST_IP" \
-                "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP" \
-                --dhcp-leasefile=/dev/null \
-                --log-facility=- --log-dhcp \
-                2>>"$run_dir/dnsmasq.log" &
-            echo $! > "$state_dir/dnsmasq.pid"
-            sleep 0.3
-            kill -0 "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null \
-                || die "dnsmasq failed to start (see $run_dir/dnsmasq.log)"
-            ;;
-        filtered)
-            log_sub "Mode: filtered (domain allowlist)"
-            local dnsmasq_args=(
-                --no-resolv --no-hosts --bind-interfaces
-                "--listen-address=$TAP_HOST_IP"
-                --except-interface=lo
-                --keep-in-foreground
-                "--dhcp-range=$TAP_GUEST_IP,$TAP_GUEST_IP,infinite"
-                "--dhcp-option=option:router,$TAP_HOST_IP"
-                "--dhcp-option=option:dns-server,$TAP_HOST_IP"
-                "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP"
-                --dhcp-leasefile=/dev/null
-                --log-facility=- --log-dhcp
-            )
-            while IFS= read -r domain; do
-                [ -z "$domain" ] && continue
-                domain="${domain#\*.}"
-                for upstream in "${upstream_dns[@]}"; do
-                    dnsmasq_args+=("--server=/$domain/$upstream")
-                done
-            done < "$domains_file"
-            sudo dnsmasq "${dnsmasq_args[@]}" 2>>"$run_dir/dnsmasq.log" &
-            echo $! > "$state_dir/dnsmasq.pid"
-            sleep 0.3
-            kill -0 "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null \
-                || die "dnsmasq failed to start (see $run_dir/dnsmasq.log)"
+                sudo dnsmasq --port=0 --bind-interfaces \
+                    "--listen-address=$TAP_HOST_IP" \
+                    --except-interface=lo \
+                    --keep-in-foreground \
+                    "--dhcp-range=$TAP_GUEST_IP,$TAP_GUEST_IP,infinite" \
+                    "--dhcp-option=option:router,$TAP_HOST_IP" \
+                    "--dhcp-option=option:dns-server,$TAP_HOST_IP" \
+                    "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP" \
+                    --dhcp-leasefile=/dev/null \
+                    --log-facility=- --log-dhcp \
+                    2>>"$run_dir/dnsmasq.log" &
+                echo $! > "$state_dir/dnsmasq.pid"
+                sleep 0.3
+                kill -0 "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null \
+                    || die "dnsmasq failed to start (see $run_dir/dnsmasq.log)"
+                ;;
+            filtered)
+                log_sub "Mode: filtered (domain allowlist)"
+                local dnsmasq_args=(
+                    --no-resolv --no-hosts --bind-interfaces
+                    "--listen-address=$TAP_HOST_IP"
+                    --except-interface=lo
+                    --keep-in-foreground
+                    "--dhcp-range=$TAP_GUEST_IP,$TAP_GUEST_IP,infinite"
+                    "--dhcp-option=option:router,$TAP_HOST_IP"
+                    "--dhcp-option=option:dns-server,$TAP_HOST_IP"
+                    "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP"
+                    --dhcp-leasefile=/dev/null
+                    --log-facility=- --log-dhcp
+                )
+                while IFS= read -r domain; do
+                    [ -z "$domain" ] && continue
+                    domain="${domain#\*.}"
+                    for upstream in "${upstream_dns[@]}"; do
+                        dnsmasq_args+=("--server=/$domain/$upstream")
+                    done
+                done < "$domains_file"
+                sudo dnsmasq "${dnsmasq_args[@]}" 2>>"$run_dir/dnsmasq.log" &
+                echo $! > "$state_dir/dnsmasq.pid"
+                sleep 0.3
+                kill -0 "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null \
+                    || die "dnsmasq failed to start (see $run_dir/dnsmasq.log)"
 
-            local ports_rule=""
-            [ -n "$allowed_ports" ] && \
-                ports_rule="iifname \"$TAP_DEV\" tcp dport { $allowed_ports } accept"
-            sudo nft -f - <<NFTEOF
+                local ports_rule=""
+                [ -n "$allowed_ports" ] && \
+                    ports_rule="iifname \"$TAP_DEV\" tcp dport { $allowed_ports } accept"
+                sudo nft -f - <<NFTEOF
 table inet $NFT_TABLE {
     chain input {
         type filter hook input priority 0;
@@ -258,37 +444,37 @@ table inet $NFT_TABLE {
     }
 }
 NFTEOF
-            sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
-            # Docker's iptables FORWARD chain (policy DROP) intercepts forwarded
-            # packets. Add ACCEPT rules in DOCKER-USER so they're not dropped.
-            if sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
-                sudo iptables -I DOCKER-USER -i $TAP_DEV -j ACCEPT
-                sudo iptables -I DOCKER-USER -o $TAP_DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-            fi
-            ;;
-        open)
-            log_sub "Mode: open (all traffic forwarded)"
-            local open_args=(
-                --no-resolv --no-hosts --bind-interfaces
-                "--listen-address=$TAP_HOST_IP"
-                --except-interface=lo
-                --keep-in-foreground
-                "--dhcp-range=$TAP_GUEST_IP,$TAP_GUEST_IP,infinite"
-                "--dhcp-option=option:router,$TAP_HOST_IP"
-                "--dhcp-option=option:dns-server,$TAP_HOST_IP"
-                "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP"
-                --dhcp-leasefile=/dev/null
-                --log-facility=- --log-dhcp
-            )
-            for upstream in "${upstream_dns[@]}"; do
-                open_args+=("--server=$upstream")
-            done
-            sudo dnsmasq "${open_args[@]}" 2>>"$run_dir/dnsmasq.log" &
-            echo $! > "$state_dir/dnsmasq.pid"
-            sleep 0.3
-            kill -0 "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null \
-                || die "dnsmasq failed to start (see $run_dir/dnsmasq.log)"
-            sudo nft -f - <<NFTEOF
+                sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+                # Docker's iptables FORWARD chain (policy DROP) intercepts forwarded
+                # packets. Add ACCEPT rules in DOCKER-USER so they're not dropped.
+                if sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+                    sudo iptables -I DOCKER-USER -i $TAP_DEV -j ACCEPT
+                    sudo iptables -I DOCKER-USER -o $TAP_DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+                fi
+                ;;
+            open)
+                log_sub "Mode: open (all traffic forwarded)"
+                local open_args=(
+                    --no-resolv --no-hosts --bind-interfaces
+                    "--listen-address=$TAP_HOST_IP"
+                    --except-interface=lo
+                    --keep-in-foreground
+                    "--dhcp-range=$TAP_GUEST_IP,$TAP_GUEST_IP,infinite"
+                    "--dhcp-option=option:router,$TAP_HOST_IP"
+                    "--dhcp-option=option:dns-server,$TAP_HOST_IP"
+                    "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP"
+                    --dhcp-leasefile=/dev/null
+                    --log-facility=- --log-dhcp
+                )
+                for upstream in "${upstream_dns[@]}"; do
+                    open_args+=("--server=$upstream")
+                done
+                sudo dnsmasq "${open_args[@]}" 2>>"$run_dir/dnsmasq.log" &
+                echo $! > "$state_dir/dnsmasq.pid"
+                sleep 0.3
+                kill -0 "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null \
+                    || die "dnsmasq failed to start (see $run_dir/dnsmasq.log)"
+                sudo nft -f - <<NFTEOF
 table inet $NFT_TABLE {
     chain forward {
         type filter hook forward priority 0; policy accept;
@@ -299,206 +485,207 @@ table inet $NFT_TABLE {
     }
 }
 NFTEOF
-            sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
-            if sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
-                sudo iptables -I DOCKER-USER -i $TAP_DEV -j ACCEPT
-                sudo iptables -I DOCKER-USER -o $TAP_DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+                sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+                if sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+                    sudo iptables -I DOCKER-USER -i $TAP_DEV -j ACCEPT
+                    sudo iptables -I DOCKER-USER -o $TAP_DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+                fi
+                ;;
+            *)
+                die "Unknown network mode: $network"
+                ;;
+        esac
+
+        # --- Start virtiofsd for nix-store share (required by microvm config) ---
+        log "==> Starting virtiofsd for nix-store..."
+        local nix_store_sock="$run_dir/nixbox-virtiofs-nix-store.sock"
+        virtiofsd --socket-path="$nix_store_sock" --shared-dir="/nix/store" --sandbox=none --translate-uid="map:1000:$(id -u):1" --translate-gid="map:100:$(id -g):1" --cache=auto 2>"$run_dir/virtiofsd-nix-store.log" &
+        echo "$!" > "$state_dir/virtiofsd_nix_store_pid"
+        for _ in $(seq 1 10); do [ -S "$nix_store_sock" ] && break; sleep 0.2; done
+        [ -S "$nix_store_sock" ] || die "virtiofsd socket for nix-store did not appear"
+
+        # --- Start virtiofsd for each user mount ---
+        local mount_count
+        mount_count=$(echo "$mounts_json" | jq 'length')
+        if [ "$mount_count" -gt 0 ]; then
+            log "==> Starting virtiofsd for $mount_count mount(s)..."
+            for i in $(seq 0 $((mount_count - 1))); do
+                local src
+                src=$(echo "$mounts_json" | jq -r ".[$i].source")
+                src="${src/#\~/$HOME}"
+                [[ "$src" != /* ]] && src="$(realpath "${project_dir}/${src}")"
+                [ ! -d "$src" ] && die "Mount source does not exist: $src"
+
+                local virtiofs_sock="$run_dir/virtiofs-${i}.sock"
+                virtiofsd --socket-path="$virtiofs_sock" --shared-dir="$src" --sandbox=none --translate-uid="map:1000:$(id -u):1" --translate-gid="map:100:$(id -g):1" --cache=auto 2>"$run_dir/virtiofsd-${i}.log" &
+                echo "$!" > "$state_dir/virtiofsd_${i}_pid"
+                for _ in $(seq 1 10); do [ -S "$virtiofs_sock" ] && break; sleep 0.2; done
+                [ -S "$virtiofs_sock" ] || die "virtiofsd socket did not appear for mount $i"
+            done
+        fi
+
+        # --- Boot VM (patched runner for vCPU/RAM) ---
+        log "==> Booting VM '$name'..."
+
+        rm -f "$run_dir/api.sock"
+
+        cp "$runner/bin/microvm-run" "$run_dir/microvm-run"
+        chmod +x "$run_dir/microvm-run"
+        sed -i "s/boot=[0-9]*/boot=$vcpus/" "$run_dir/microvm-run"
+        sed -i "s/shared=on,size=[0-9]*M/shared=on,size=${mem_mb}M/" "$run_dir/microvm-run"
+        sed -i "s/num_queues=512/num_queues=$vcpus/" "$run_dir/microvm-run"
+        sed -i "s/num_queues=256/num_queues=$vcpus/" "$run_dir/microvm-run"
+        sed -i "s/tap=vmtap0/tap=$TAP_DEV/" "$run_dir/microvm-run"
+        sed -i "s/mac=02:00:00:00:00:01/mac=$TAP_MAC/" "$run_dir/microvm-run"
+        sed -i "s/'cid=[0-9]*/'cid=$VSOCK_CID/" "$run_dir/microvm-run"
+
+        cd "$run_dir"
+        ulimit -n 65536
+        "$run_dir/microvm-run" >> "$run_dir/vm.log" 2>&1 &
+        local vm_pid=$!
+        echo "$vm_pid" > "$state_dir/pid"
+        echo "$name" > "$state_dir/name"
+        date +%s > "$state_dir/start_time"
+
+        # --- Wait for API socket ---
+        log "==> Waiting for cloud-hypervisor API..."
+        local api_sock="$run_dir/api.sock"
+        for _ in $(seq 1 30); do
+            [ -S "$api_sock" ] && break
+            sleep 1
+        done
+        if [ ! -S "$api_sock" ]; then
+            die "API socket did not appear after 30s"
+        fi
+
+        # Wait for API to actually respond
+        for _ in $(seq 1 30); do
+            if curl -s --max-time 2 --unix-socket "$api_sock" "http://localhost/api/v1/vm.info" >/dev/null 2>&1; then
+                break
             fi
-            ;;
-        *)
-            die "Unknown network mode: $network"
-            ;;
-    esac
-
-    # --- Start virtiofsd for nix-store share (required by microvm config) ---
-    log "==> Starting virtiofsd for nix-store..."
-    local nix_store_sock="$run_dir/nixbox-virtiofs-nix-store.sock"
-    virtiofsd --socket-path="$nix_store_sock" --shared-dir="/nix/store" --sandbox=none --translate-uid="map:1000:$(id -u):1" --translate-gid="map:100:$(id -g):1" --cache=auto 2>"$run_dir/virtiofsd-nix-store.log" &
-    echo "$!" > "$state_dir/virtiofsd_nix_store_pid"
-    for _ in $(seq 1 10); do [ -S "$nix_store_sock" ] && break; sleep 0.2; done
-    [ -S "$nix_store_sock" ] || die "virtiofsd socket for nix-store did not appear"
-
-    # --- Start virtiofsd for each user mount ---
-    local mount_count
-    mount_count=$(echo "$mounts_json" | jq 'length')
-    if [ "$mount_count" -gt 0 ]; then
-        log "==> Starting virtiofsd for $mount_count mount(s)..."
-        for i in $(seq 0 $((mount_count - 1))); do
-            local src
-            src=$(echo "$mounts_json" | jq -r ".[$i].source")
-            src="${src/#\~/$HOME}"
-            [[ "$src" != /* ]] && src="$(realpath "${project_dir}/${src}")"
-            [ ! -d "$src" ] && die "Mount source does not exist: $src"
-
-            local virtiofs_sock="$run_dir/virtiofs-${i}.sock"
-            virtiofsd --socket-path="$virtiofs_sock" --shared-dir="$src" --sandbox=none --translate-uid="map:1000:$(id -u):1" --translate-gid="map:100:$(id -g):1" --cache=auto 2>"$run_dir/virtiofsd-${i}.log" &
-            echo "$!" > "$state_dir/virtiofsd_${i}_pid"
-            for _ in $(seq 1 10); do [ -S "$virtiofs_sock" ] && break; sleep 0.2; done
-            [ -S "$virtiofs_sock" ] || die "virtiofsd socket did not appear for mount $i"
+            sleep 1
         done
-    fi
 
-    # --- Boot VM (patched runner for vCPU/RAM) ---
-    log "==> Booting VM '$name'..."
-
-    rm -f "$run_dir/api.sock"
-
-    cp "$runner/bin/microvm-run" "$run_dir/microvm-run"
-    chmod +x "$run_dir/microvm-run"
-    sed -i "s/boot=[0-9]*/boot=$vcpus/" "$run_dir/microvm-run"
-    sed -i "s/shared=on,size=[0-9]*M/shared=on,size=${mem_mb}M/" "$run_dir/microvm-run"
-    sed -i "s/num_queues=512/num_queues=$vcpus/" "$run_dir/microvm-run"
-    sed -i "s/num_queues=256/num_queues=$vcpus/" "$run_dir/microvm-run"
-    sed -i "s/tap=vmtap0/tap=$TAP_DEV/" "$run_dir/microvm-run"
-    sed -i "s/mac=02:00:00:00:00:01/mac=$TAP_MAC/" "$run_dir/microvm-run"
-    sed -i "s/'cid=[0-9]*/'cid=$VSOCK_CID/" "$run_dir/microvm-run"
-
-    cd "$run_dir"
-    ulimit -n 65536
-    "$run_dir/microvm-run" >> "$run_dir/vm.log" 2>&1 &
-    local vm_pid=$!
-    echo "$vm_pid" > "$state_dir/pid"
-    echo "$name" > "$state_dir/name"
-    date +%s > "$state_dir/start_time"
-
-    # --- Wait for API socket ---
-    log "==> Waiting for cloud-hypervisor API..."
-    local api_sock="$run_dir/api.sock"
-    for _ in $(seq 1 30); do
-        [ -S "$api_sock" ] && break
-        sleep 1
-    done
-    if [ ! -S "$api_sock" ]; then
-        die "API socket did not appear after 30s"
-    fi
-
-    # Wait for API to actually respond
-    for _ in $(seq 1 30); do
-        if curl -s --max-time 2 --unix-socket "$api_sock" "http://localhost/api/v1/vm.info" >/dev/null 2>&1; then
-            break
+        # Check VM is still alive
+        if ! kill -0 "$vm_pid" 2>/dev/null; then
+            log "==> VM process died. Log tail:" >&2
+            tail -20 "$run_dir/vm.log" >&2
+            die "VM crashed before API became ready"
         fi
-        sleep 1
-    done
 
-    # Check VM is still alive
-    if ! kill -0 "$vm_pid" 2>/dev/null; then
-        log "==> VM process died. Log tail:" >&2
-        tail -20 "$run_dir/vm.log" >&2
-        die "VM crashed before API became ready"
-    fi
+        # --- Hot-plug env disk ---
+        log "==> Hot-plugging env disk..."
+        local env_img_abs
+        env_img_abs=$(realpath "$run_dir/env.img")
+        local disk_response
+        disk_response=$(curl -s --max-time 30 --unix-socket "$api_sock" -X PUT \
+            "http://localhost/api/v1/vm.add-disk" \
+            -H "Content-Type: application/json" \
+            -d "{\"path\": \"$env_img_abs\", \"readonly\": true, \"id\": \"env-disk\"}" 2>&1) \
+            || die "env disk hot-plug curl failed (exit $?): $disk_response"
+        [ -n "$disk_response" ] && log_sub "env-disk: $disk_response"
 
-    # --- Hot-plug env disk ---
-    log "==> Hot-plugging env disk..."
-    local env_img_abs
-    env_img_abs=$(realpath "$run_dir/env.img")
-    local disk_response
-    disk_response=$(curl -s --max-time 30 --unix-socket "$api_sock" -X PUT \
-        "http://localhost/api/v1/vm.add-disk" \
-        -H "Content-Type: application/json" \
-        -d "{\"path\": \"$env_img_abs\", \"readonly\": true, \"id\": \"env-disk\"}" 2>&1) \
-        || die "env disk hot-plug curl failed (exit $?): $disk_response"
-    [ -n "$disk_response" ] && log_sub "env-disk: $disk_response"
-
-    # --- Hot-plug virtiofs for each mount ---
-    if [ "$mount_count" -gt 0 ]; then
-        for i in $(seq 0 $((mount_count - 1))); do
-            local virtiofs_sock_abs
-            virtiofs_sock_abs=$(realpath "$run_dir/virtiofs-${i}.sock")
-            curl -s --unix-socket "$api_sock" -X PUT \
-                "http://localhost/api/v1/vm.add-fs" \
-                -H "Content-Type: application/json" \
-                -d "{\"tag\": \"mount-$i\", \"socket\": \"$virtiofs_sock_abs\", \"num_queues\": 1, \"queue_size\": 1024, \"id\": \"mount-$i\"}"
-        done
-        echo ""
-    fi
-
-    # --- Wait for SSH ---
-    local ssh_timeout="${NIXBOX_SSH_TIMEOUT:-120}"
-    log "==> Waiting for SSH readiness..."
-    for _ in $(seq 1 "$ssh_timeout"); do
-        if ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 ${VM_USER}@"$TAP_GUEST_IP" "true" 2>>"$run_dir/ssh-wait.log"; then
-            break
+        # --- Hot-plug virtiofs for each mount ---
+        if [ "$mount_count" -gt 0 ]; then
+            for i in $(seq 0 $((mount_count - 1))); do
+                local virtiofs_sock_abs
+                virtiofs_sock_abs=$(realpath "$run_dir/virtiofs-${i}.sock")
+                curl -s --unix-socket "$api_sock" -X PUT \
+                    "http://localhost/api/v1/vm.add-fs" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"tag\": \"mount-$i\", \"socket\": \"$virtiofs_sock_abs\", \"num_queues\": 1, \"queue_size\": 1024, \"id\": \"mount-$i\"}"
+            done
+            echo ""
         fi
-        sleep 1
-    done
-    if ! ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 ${VM_USER}@"$TAP_GUEST_IP" "true" 2>>"$run_dir/ssh-wait.log"; then
-        # Save pre-cleanup diagnostics before do_destroy wipes state
-        {
-            echo "=== Ping test ==="
-            ping -c1 -W1 "$TAP_GUEST_IP" 2>&1 || true
-            echo "=== TAP traffic counters ==="
-            ip -s link show "$TAP_DEV" 2>&1 || echo "(no TAP)"
-            echo "=== Route to guest IP ==="
-            ip route get "$TAP_GUEST_IP" 2>&1 || echo "(no route)"
-            echo "=== ARP/neighbor state ==="
-            ip neigh show dev "$TAP_DEV" 2>&1 || echo "(no neigh)"
-            echo "=== cloud-hypervisor net arg ==="
-            grep -E 'net |tap=' "$run_dir/microvm-run" 2>/dev/null | head -3 || echo "(no microvm-run)"
-            echo "=== iptables INPUT chain ==="
-            sudo -n iptables -L INPUT -n -v 2>&1 || echo "(no iptables)"
-            echo "=== nftables full ruleset ==="
-            sudo -n nft list ruleset 2>/dev/null || echo "(no rules)"
-        } > "$run_dir/ssh-fail-diag.log" 2>&1
-        die "SSH not ready after ${ssh_timeout}s"
-    fi
 
-    # --- Inject VM SSH key for outbound connections (e.g. GitHub) ---
-    log "==> Injecting SSH identity..."
-    ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-    scp -q "${SSH_OPTS[@]}" "$SSH_KEY" "${VM_USER}@${TAP_GUEST_IP}:~/.ssh/id_ed25519"
-    ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "chmod 600 ~/.ssh/id_ed25519"
-    log_sub "SSH key: $(cat "${SSH_KEY}.pub")"
-
-    # --- Mount virtiofs inside guest ---
-    if [ "$mount_count" -gt 0 ]; then
-        for i in $(seq 0 $((mount_count - 1))); do
-            local tgt ro src
-            tgt=$(echo "$mounts_json" | jq -r ".[$i].target")
-            tgt="${tgt/#\~//home/${VM_USER}}"
-            ro=$(echo "$mounts_json" | jq -r ".[$i].readonly")
-            src=$(echo "$mounts_json" | jq -r ".[$i].source")
-            src="${src/#\~/$HOME}"
-            [[ "$src" != /* ]] && src="$(realpath "${project_dir}/${src}")"
-
-            local ro_flag=""
-            [ "$ro" = "true" ] && ro_flag="-o ro"
-            ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" \
-                "sudo mkdir -p '$tgt' && sudo mount -t virtiofs $ro_flag mount-$i '$tgt' && sudo chown ${VM_USER}:users '$tgt' 2>/dev/null || true"
-            log_sub "Mounted $src → $tgt"
-
-            local ro_val=0; [ "$ro" = "true" ] && ro_val=1
-            echo "$i|$src|$tgt|$ro_val" > "$state_dir/mount_$i"
+        # --- Wait for SSH ---
+        local ssh_timeout="${NIXBOX_SSH_TIMEOUT:-120}"
+        log "==> Waiting for SSH readiness..."
+        for _ in $(seq 1 "$ssh_timeout"); do
+            if ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 ${VM_USER}@"$TAP_GUEST_IP" "true" 2>>"$run_dir/ssh-wait.log"; then
+                break
+            fi
+            sleep 1
         done
+        if ! ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 ${VM_USER}@"$TAP_GUEST_IP" "true" 2>>"$run_dir/ssh-wait.log"; then
+            # Save pre-cleanup diagnostics before do_destroy wipes state
+            {
+                echo "=== Ping test ==="
+                ping -c1 -W1 "$TAP_GUEST_IP" 2>&1 || true
+                echo "=== TAP traffic counters ==="
+                ip -s link show "$TAP_DEV" 2>&1 || echo "(no TAP)"
+                echo "=== Route to guest IP ==="
+                ip route get "$TAP_GUEST_IP" 2>&1 || echo "(no route)"
+                echo "=== ARP/neighbor state ==="
+                ip neigh show dev "$TAP_DEV" 2>&1 || echo "(no neigh)"
+                echo "=== cloud-hypervisor net arg ==="
+                grep -E 'net |tap=' "$run_dir/microvm-run" 2>/dev/null | head -3 || echo "(no microvm-run)"
+                echo "=== iptables INPUT chain ==="
+                sudo -n iptables -L INPUT -n -v 2>&1 || echo "(no iptables)"
+                echo "=== nftables full ruleset ==="
+                sudo -n nft list ruleset 2>/dev/null || echo "(no rules)"
+            } > "$run_dir/ssh-fail-diag.log" 2>&1
+            die "SSH not ready after ${ssh_timeout}s"
+        fi
 
-    fi
+        # --- Inject VM SSH key for outbound connections (e.g. GitHub) ---
+        log "==> Injecting SSH identity..."
+        ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+        scp -q "${SSH_OPTS[@]}" "$SSH_KEY" "${VM_USER}@${TAP_GUEST_IP}:~/.ssh/id_ed25519"
+        ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "chmod 600 ~/.ssh/id_ed25519"
+        log_sub "SSH key: $(cat "${SSH_KEY}.pub")"
 
-    # --- Run user scripts ---
-    local scripts_json
-    scripts_json=$(echo "$CONFIG_JSON" | jq -r '.scripts // []')
-    local script_count
-    script_count=$(echo "$scripts_json" | jq 'length')
-    if [ "$script_count" -gt 0 ]; then
-        log "==> Running setup scripts..."
-        for i in $(seq 0 $((script_count - 1))); do
-            local script_path
-            script_path=$(echo "$scripts_json" | jq -r ".[$i]")
-            [[ "$script_path" != /* ]] && script_path="$(realpath "${project_dir}/${script_path}")"
-            [ ! -f "$script_path" ] && { log_sub "WARNING: script not found: $script_path"; continue; }
-            local script_name
-            script_name=$(basename "$script_path")
-            scp -q "${SSH_OPTS[@]}" "$script_path" "${VM_USER}@$TAP_GUEST_IP:/tmp/$script_name"
-            ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "chmod +x /tmp/$script_name && /tmp/$script_name && rm /tmp/$script_name"
-            log_sub "Ran $script_path"
-        done
-    fi
+        # --- Mount virtiofs inside guest ---
+        if [ "$mount_count" -gt 0 ]; then
+            for i in $(seq 0 $((mount_count - 1))); do
+                local tgt ro src
+                tgt=$(echo "$mounts_json" | jq -r ".[$i].target")
+                tgt="${tgt/#\~//home/${VM_USER}}"
+                ro=$(echo "$mounts_json" | jq -r ".[$i].readonly")
+                src=$(echo "$mounts_json" | jq -r ".[$i].source")
+                src="${src/#\~/$HOME}"
+                [[ "$src" != /* ]] && src="$(realpath "${project_dir}/${src}")"
 
-    # --- Connectivity check (skip for off) ---
-    if [ "$network" != "off" ]; then
-        log "==> Connectivity check..."
-        if ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "curl -sf --max-time 5 https://cache.nixos.org >/dev/null 2>&1"; then
-            log_sub "Nix cache: OK"
-        else
-            log_sub "WARNING: Nix cache unreachable"
+                local ro_flag=""
+                [ "$ro" = "true" ] && ro_flag="-o ro"
+                ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" \
+                    "sudo mkdir -p '$tgt' && sudo mount -t virtiofs $ro_flag mount-$i '$tgt' && sudo chown ${VM_USER}:users '$tgt' 2>/dev/null || true"
+                log_sub "Mounted $src → $tgt"
+
+                local ro_val=0; [ "$ro" = "true" ] && ro_val=1
+                echo "$i|$src|$tgt|$ro_val" > "$state_dir/mount_$i"
+            done
+
+        fi
+
+        # --- Run user scripts ---
+        local scripts_json
+        scripts_json=$(echo "$CONFIG_JSON" | jq -r '.scripts // []')
+        local script_count
+        script_count=$(echo "$scripts_json" | jq 'length')
+        if [ "$script_count" -gt 0 ]; then
+            log "==> Running setup scripts..."
+            for i in $(seq 0 $((script_count - 1))); do
+                local script_path
+                script_path=$(echo "$scripts_json" | jq -r ".[$i]")
+                [[ "$script_path" != /* ]] && script_path="$(realpath "${project_dir}/${script_path}")"
+                [ ! -f "$script_path" ] && { log_sub "WARNING: script not found: $script_path"; continue; }
+                local script_name
+                script_name=$(basename "$script_path")
+                scp -q "${SSH_OPTS[@]}" "$script_path" "${VM_USER}@$TAP_GUEST_IP:/tmp/$script_name"
+                ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "chmod +x /tmp/$script_name && /tmp/$script_name && rm /tmp/$script_name"
+                log_sub "Ran $script_path"
+            done
+        fi
+
+        # --- Connectivity check (skip for off) ---
+        if [ "$network" != "off" ]; then
+            log "==> Connectivity check..."
+            if ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "curl -sf --max-time 5 https://cache.nixos.org >/dev/null 2>&1"; then
+                log_sub "Nix cache: OK"
+            else
+                log_sub "WARNING: Nix cache unreachable"
+            fi
         fi
     fi
 
@@ -514,11 +701,18 @@ do_ssh() {
 
     [ ! -d "$state_dir" ] && die "VM '$name' not found"
 
+    local target_ip
+    if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+        target_ip=$(cat "$state_dir/guest_ip" 2>/dev/null) || die "Guest IP not found. Is the VM running?"
+    else
+        target_ip="$TAP_GUEST_IP"
+    fi
+
     if [ -z "$cmd" ]; then
-        exec ssh -t "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP"
+        exec ssh -t "${SSH_OPTS[@]}" ${VM_USER}@"$target_ip"
     else
         local escaped_cmd="${cmd//\'/\'\\\'\'}"
-        ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" -- "bash -lc '${escaped_cmd}'"
+        ssh "${SSH_OPTS[@]}" ${VM_USER}@"$target_ip" -- "bash -lc '${escaped_cmd}'"
     fi
 }
 
@@ -528,6 +722,8 @@ do_mount() {
     local state_dir="$NIXBOX_DIR/state"
     local run_dir="$NIXBOX_DIR/run"
     local api_sock="$run_dir/api.sock"
+
+    [ "$NIXBOX_PLATFORM" = "darwin" ] && die "Hot-plug mount/unmount not supported on macOS. Add mounts to config.nix and restart the VM."
 
     [ ! -d "$state_dir" ] && die "VM '$name' not found"
 
@@ -579,6 +775,8 @@ do_unmount() {
     local run_dir="$NIXBOX_DIR/run"
     local api_sock="$run_dir/api.sock"
 
+    [ "$NIXBOX_PLATFORM" = "darwin" ] && die "Hot-plug mount/unmount not supported on macOS. Add mounts to config.nix and restart the VM."
+
     [ ! -d "$state_dir" ] && die "VM '$name' not found"
 
     local mount_idx=""
@@ -614,35 +812,76 @@ do_unmount() {
 }
 
 do_list() {
-    local found=0
-    printf "%-15s %-10s %-12s %-10s %-6s\n" "NAME" "PID" "UPTIME" "STATUS" "SLOT"
-    printf "%-15s %-10s %-12s %-10s %-6s\n" "----" "---" "------" "------" "----"
-    mkdir -p "$SLOTS_DIR"
-    for slot_file in "$SLOTS_DIR"/*; do
-        [ -f "$slot_file" ] || continue
-        local nixbox_dir slot state_dir name pid start status uptime
-        nixbox_dir=$(cat "$slot_file")
-        slot=$(basename "$slot_file")
-        state_dir="$nixbox_dir/state"
-        [ -d "$state_dir" ] || continue
+    if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+        # Darwin: single-VM mode via ACTIVE_FILE
+        local nixbox_dir=""
+        if [ -f "$ACTIVE_FILE" ]; then
+            nixbox_dir="$(cat "$ACTIVE_FILE")"
+        elif nixbox_dir="$(find_nixbox_dir 2>/dev/null)"; then
+            :
+        fi
+
+        if [ -z "$nixbox_dir" ] || [ ! -d "$nixbox_dir/state" ] || [ ! -f "$nixbox_dir/state/pid" ]; then
+            echo "No VMs found."
+            return 0
+        fi
+
+        local state_dir="$nixbox_dir/state"
+
+        printf "%-15s %-10s %-12s %-10s\n" "NAME" "PID" "UPTIME" "STATUS"
+        printf "%-15s %-10s %-12s %-10s\n" "----" "---" "------" "------"
+
+        local name pid start status uptime
         name=$(cat "$state_dir/name" 2>/dev/null || basename "$(dirname "$nixbox_dir")")
         pid=$(cat "$state_dir/pid" 2>/dev/null || echo "-")
         start=$(cat "$state_dir/start_time" 2>/dev/null || echo "0")
+
         if [ "$pid" != "-" ] && kill -0 "$pid" 2>/dev/null; then
             status="running"
+            local now uptime_secs hours mins
+            now=$(date +%s)
+            uptime_secs=$((now - start))
+            hours=$((uptime_secs / 3600))
+            mins=$(( (uptime_secs % 3600) / 60 ))
+            uptime="${hours}h${mins}m"
         else
             status="dead"
+            uptime="-"
         fi
-        local now elapsed hours mins
-        now=$(date +%s)
-        elapsed=$((now - start))
-        hours=$((elapsed / 3600))
-        mins=$(( (elapsed % 3600) / 60 ))
-        uptime="${hours}h${mins}m"
-        printf "%-15s %-10s %-12s %-10s %-6s\n" "$name" "$pid" "$uptime" "$status" "$slot"
-        found=1
-    done
-    [ "$found" -eq 0 ] && echo "No VMs running."
+
+        printf "%-15s %-10s %-12s %-10s\n" "$name" "$pid" "$uptime" "$status"
+    else
+        # Linux: multi-slot mode
+        local found=0
+        printf "%-15s %-10s %-12s %-10s %-6s\n" "NAME" "PID" "UPTIME" "STATUS" "SLOT"
+        printf "%-15s %-10s %-12s %-10s %-6s\n" "----" "---" "------" "------" "----"
+        mkdir -p "$SLOTS_DIR"
+        for slot_file in "$SLOTS_DIR"/*; do
+            [ -f "$slot_file" ] || continue
+            local nixbox_dir slot state_dir name pid start status uptime
+            nixbox_dir=$(cat "$slot_file")
+            slot=$(basename "$slot_file")
+            state_dir="$nixbox_dir/state"
+            [ -d "$state_dir" ] || continue
+            name=$(cat "$state_dir/name" 2>/dev/null || basename "$(dirname "$nixbox_dir")")
+            pid=$(cat "$state_dir/pid" 2>/dev/null || echo "-")
+            start=$(cat "$state_dir/start_time" 2>/dev/null || echo "0")
+            if [ "$pid" != "-" ] && kill -0 "$pid" 2>/dev/null; then
+                status="running"
+            else
+                status="dead"
+            fi
+            local now elapsed hours mins
+            now=$(date +%s)
+            elapsed=$((now - start))
+            hours=$((elapsed / 3600))
+            mins=$(( (elapsed % 3600) / 60 ))
+            uptime="${hours}h${mins}m"
+            printf "%-15s %-10s %-12s %-10s %-6s\n" "$name" "$pid" "$uptime" "$status" "$slot"
+            found=1
+        done
+        [ "$found" -eq 0 ] && echo "No VMs running."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -650,14 +889,30 @@ do_list() {
 # ---------------------------------------------------------------------------
 
 ensure_setup() {
-    for cmd in nix jq dnsmasq nft mke2fs virtiofsd; do
-        command -v "$cmd" &>/dev/null || die "$cmd not found. Install it first."
-    done
-    [ -e /dev/kvm ] || die "/dev/kvm not found. KVM is required."
+    if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+        for cmd in nix jq mke2fs; do
+            command -v "$cmd" &>/dev/null || die "$cmd not found. Install it first."
+        done
+    else
+        for cmd in nix jq dnsmasq nft mke2fs virtiofsd; do
+            command -v "$cmd" &>/dev/null || die "$cmd not found. Install it first."
+        done
+        [ -e /dev/kvm ] || die "/dev/kvm not found. KVM is required."
+    fi
     mkdir -p "$NIXBOX_DIR"/{ssh,state,run,tmp}
     if [ ! -f "$SSH_KEY" ]; then
         log "==> Generating SSH key pair..."
         ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "nixbox"
+    fi
+}
+
+_nix_system() {
+    local arch
+    arch="$(uname -m)"
+    if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+        echo "${arch}-darwin"
+    else
+        echo "${arch}-linux"
     fi
 }
 
@@ -685,7 +940,9 @@ ensure_build() {
     cp -r "$NIXBOX_SRC/plugins" "$build_dir/"
     cp "$config_path" "$build_dir/project-config.nix"
     cp "$ssh_pub" "$build_dir/ssh_key.pub"
-    echo "{ username = \"$VM_USER\"; }" > "$build_dir/host-info.nix"
+    local nix_system
+    nix_system="$(_nix_system)"
+    echo "{ username = \"$VM_USER\"; hostSystem = \"$nix_system\"; }" > "$build_dir/host-info.nix"
 
     # Use project-pinned flake.lock if available; otherwise nix resolves latest
     local user_lock="$NIXBOX_DIR/flake.lock"
@@ -696,12 +953,12 @@ ensure_build() {
     (cd "$build_dir" && git init -q && git add -A && git commit -q -m "build" --allow-empty)
 
     log "==> Building VM runner..."
-    (cd "$build_dir" && nix build .#vm-runner)
+    (cd "$build_dir" && nix build ".#packages.${nix_system}.vm-runner")
 
     # Persist the resolved flake.lock back to the project
     cp "$build_dir/flake.lock" "$NIXBOX_DIR/flake.lock"
 
-    ln -sfn "$(readlink -f "$build_dir/result")" "$runner"
+    ln -sfn "$(_portable_realpath "$build_dir/result")" "$runner"
     echo "$current_hash" > "$hash_file"
     log "==> Build complete."
 }
@@ -776,13 +1033,21 @@ cmd_up() {
         echo "$CONFIG_JSON" | jq -r '.network.domains[]' > "$domains_file"
     fi
 
-    VM_SLOT=$(allocate_slot "$NIXBOX_DIR")
-    derive_network "$VM_SLOT" "$project_name"
+    if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+        check_no_conflicting_vm
+    else
+        VM_SLOT=$(allocate_slot "$NIXBOX_DIR")
+        derive_network "$VM_SLOT" "$project_name"
+    fi
 
     local vcpus mem_mb
     vcpus="$(jq_field '.resources.vcpus')"
     mem_mb="$(jq_field '.resources.memoryMB')"
     log "==> Starting VM '$project_name' [network=$network, vcpus=$vcpus, mem=${mem_mb}MB]"
+
+    if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+        echo "$NIXBOX_DIR" > "$ACTIVE_FILE"
+    fi
 
     run_hooks "pre-up"
     do_create "$project_name" "$mounts_json" "$domains_file" "$project_dir"
@@ -797,13 +1062,19 @@ cmd_down() {
     local project_name
     project_name="$(get_project_name)"
 
-    local vm_slot
-    vm_slot=$(cat "$NIXBOX_DIR/state/slot" 2>/dev/null || echo "0")
-    derive_network "$vm_slot" "$project_name"
+    if [ "$NIXBOX_PLATFORM" != "darwin" ]; then
+        local vm_slot
+        vm_slot=$(cat "$NIXBOX_DIR/state/slot" 2>/dev/null || echo "0")
+        derive_network "$vm_slot" "$project_name"
+    fi
 
     run_hooks "pre-down"
     do_destroy "$project_name"
-    release_slot "$NIXBOX_DIR"
+    if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+        rm -f "$ACTIVE_FILE"
+    else
+        release_slot "$NIXBOX_DIR"
+    fi
     run_hooks "post-down"
 }
 
@@ -840,6 +1111,10 @@ cmd_unmount() {
 
 cmd_status() {
     do_list
+    if [ "$NIXBOX_PLATFORM" = "darwin" ] && [ -f "$ACTIVE_FILE" ]; then
+        echo ""
+        echo "Active workspace: $(dirname "$(cat "$ACTIVE_FILE")")"
+    fi
 }
 
 cmd_config() {
@@ -853,20 +1128,31 @@ cmd_doctor() {
     local errors=0
 
     log "==> Checking prerequisites..."
-    for cmd in nix jq dnsmasq nft mke2fs virtiofsd; do
-        if command -v "$cmd" &>/dev/null; then
-            log_sub "$cmd: OK"
+    if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
+        for cmd in nix jq mke2fs; do
+            if command -v "$cmd" &>/dev/null; then
+                log_sub "$cmd: OK"
+            else
+                log_sub "$cmd: MISSING"
+                errors=$((errors + 1))
+            fi
+        done
+    else
+        for cmd in nix jq dnsmasq nft mke2fs virtiofsd; do
+            if command -v "$cmd" &>/dev/null; then
+                log_sub "$cmd: OK"
+            else
+                log_sub "$cmd: MISSING"
+                errors=$((errors + 1))
+            fi
+        done
+
+        if [ -e /dev/kvm ]; then
+            log_sub "/dev/kvm: OK"
         else
-            log_sub "$cmd: MISSING"
+            log_sub "/dev/kvm: MISSING"
             errors=$((errors + 1))
         fi
-    done
-
-    if [ -e /dev/kvm ]; then
-        log_sub "/dev/kvm: OK"
-    else
-        log_sub "/dev/kvm: MISSING"
-        errors=$((errors + 1))
     fi
 
     echo ""
