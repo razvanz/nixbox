@@ -248,4 +248,5 @@ The JDK is specified separately via `nix.packages` so you control the version. S
 
 ## Acknowledgments
 
-Inspired by [nixcage](https://github.com/hamidr/nixcage).
+- Built on [microvm.nix](https://github.com/microvm-nix/microvm.nix)
+- Inspired by [nixcage](https://github.com/hamidr/nixcage)
