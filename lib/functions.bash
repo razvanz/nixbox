@@ -94,6 +94,7 @@ get_slot() {
 # Config helpers
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2120
 find_nixbox_dir() {
     local dir="${1:-$PWD}"
     while [ "$dir" != "/" ]; do
