@@ -7,16 +7,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_DIR="$(mktemp -d)"
 
+# Build the Nix-packaged CLI (includes all wrapped deps: virtiofsd, jq, etc.)
+echo "==> Building nixbox CLI..."
+NIXBOX_CLI="$(nix build "$PROJECT_ROOT#nixbox" --no-link --print-out-paths)/bin/nixbox"
+
 cleanup() {
     echo "==> Cleanup..."
-    "$PROJECT_ROOT/bin/nixbox" down 2>/dev/null || true
+    "$NIXBOX_CLI" down 2>/dev/null || true
     rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
 
 echo "==> Creating test project in $TEST_DIR"
 cd "$TEST_DIR"
-"$PROJECT_ROOT/bin/nixbox" init
+"$NIXBOX_CLI" init
 
 # Use minimal config: open network, default resources
 cat > .nixbox/config.nix <<'NIX'
@@ -27,13 +31,13 @@ cat > .nixbox/config.nix <<'NIX'
 NIX
 
 echo "==> Building VM runner..."
-"$PROJECT_ROOT/bin/nixbox" build
+"$NIXBOX_CLI" build
 
 echo "==> Starting VM..."
-"$PROJECT_ROOT/bin/nixbox" up
+"$NIXBOX_CLI" up
 
 echo "==> Testing SSH command execution..."
-output=$("$PROJECT_ROOT/bin/nixbox" run "echo hello-from-vm")
+output=$("$NIXBOX_CLI" run "echo hello-from-vm")
 if [ "$output" = "hello-from-vm" ]; then
     echo "  ok: command execution"
 else
@@ -42,11 +46,11 @@ else
 fi
 
 echo "==> Testing network connectivity from VM..."
-"$PROJECT_ROOT/bin/nixbox" run "curl -sf --max-time 10 https://cache.nixos.org >/dev/null"
+"$NIXBOX_CLI" run "curl -sf --max-time 10 https://cache.nixos.org >/dev/null"
 echo "  ok: network connectivity"
 
 echo "==> Shutting down VM..."
-"$PROJECT_ROOT/bin/nixbox" down
+"$NIXBOX_CLI" down
 
 echo ""
 echo "E2E: all checks passed"
