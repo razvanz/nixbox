@@ -11,6 +11,19 @@ TEST_DIR="$(mktemp -d)"
 echo "==> Building nixbox CLI..."
 NIXBOX_CLI="$(nix build "$PROJECT_ROOT#nixbox" --no-link --print-out-paths)/bin/nixbox"
 
+dump_debug() {
+    echo "==> DEBUG: vm.log (last 50 lines):"
+    tail -50 .nixbox/run/vm.log 2>/dev/null || echo "(no vm.log)"
+    echo "==> DEBUG: dnsmasq status:"
+    cat .nixbox/state/dnsmasq.pid 2>/dev/null && ps -p "$(cat .nixbox/state/dnsmasq.pid 2>/dev/null)" 2>/dev/null || echo "(no dnsmasq)"
+    echo "==> DEBUG: network interfaces:"
+    ip addr show 2>/dev/null | grep -A2 'vm\|tap' || echo "(no tap devices)"
+    echo "==> DEBUG: nftables:"
+    sudo nft list ruleset 2>/dev/null | head -30 || echo "(no rules)"
+    echo "==> DEBUG: ping guest:"
+    ping -c1 -W2 172.16.0.2 2>&1 || true
+}
+
 cleanup() {
     echo "==> Cleanup..."
     "$NIXBOX_CLI" down 2>/dev/null || true
@@ -35,7 +48,7 @@ echo "==> Building VM runner..."
 "$NIXBOX_CLI" build
 
 echo "==> Starting VM..."
-"$NIXBOX_CLI" up
+"$NIXBOX_CLI" up || { dump_debug; exit 1; }
 
 echo "==> Testing SSH command execution..."
 output=$("$NIXBOX_CLI" run "echo hello-from-vm")
