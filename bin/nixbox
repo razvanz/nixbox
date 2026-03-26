@@ -381,15 +381,16 @@ NFTEOF
     fi
 
     # --- Wait for SSH ---
+    local ssh_timeout="${NIXBOX_SSH_TIMEOUT:-120}"
     log "==> Waiting for SSH readiness..."
-    for _ in $(seq 1 60); do
-        if ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "true" 2>/dev/null; then
+    for _ in $(seq 1 "$ssh_timeout"); do
+        if ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 ${VM_USER}@"$TAP_GUEST_IP" "true" 2>/dev/null; then
             break
         fi
         sleep 1
     done
-    if ! ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "true" 2>/dev/null; then
-        die "SSH not ready after 60s"
+    if ! ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 ${VM_USER}@"$TAP_GUEST_IP" "true" 2>/dev/null; then
+        die "SSH not ready after ${ssh_timeout}s"
     fi
 
     # --- Inject VM SSH key for outbound connections (e.g. GitHub) ---
