@@ -27,6 +27,7 @@ dump_debug() {
 cleanup() {
     echo "==> Cleanup..."
     "$NIXBOX_CLI" down 2>/dev/null || true
+    chmod -R u+w "$TEST_DIR" 2>/dev/null || true
     rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
