@@ -38,4 +38,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y dnsmasq nftables
       - name: E2E test
-        run: bash tests/run-e2e-tests.sh
+        run: |
+          git config --global user.email "ci@nixbox"
+          git config --global user.name "nixbox-ci"
+          bash tests/run-e2e-tests.sh
