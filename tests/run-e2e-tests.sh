@@ -22,7 +22,8 @@ echo "==> Creating test project in $TEST_DIR"
 cd "$TEST_DIR"
 "$NIXBOX_CLI" init
 
-# Use minimal config: open network, default resources
+# Overwrite template config with minimal test config
+rm -f .nixbox/config.nix
 cat > .nixbox/config.nix <<'NIX'
 {
   name = "e2e-test";
