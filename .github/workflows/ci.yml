@@ -16,10 +16,6 @@ jobs:
         uses: cachix/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
-      - uses: nix-community/cache-nix-action@v6
-        with:
-          primary-key: nix-test-${{ hashFiles('flake.lock') }}
-          restore-prefixes-first-match: nix-test-
       - name: ShellCheck
         run: nix shell nixpkgs#shellcheck -c shellcheck -x -S warning bin/nixbox lib/functions.bash plugins/*/commands/*.sh plugins/*/scripts/*.sh
       - name: BATS unit tests
