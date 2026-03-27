@@ -16,6 +16,8 @@ dump_debug() {
     tail -50 .nixbox/run/vm.log 2>/dev/null || echo "(no vm.log)"
     echo "==> DEBUG: dnsmasq status:"
     cat .nixbox/state/dnsmasq.pid 2>/dev/null && ps -p "$(cat .nixbox/state/dnsmasq.pid 2>/dev/null)" 2>/dev/null || echo "(no dnsmasq)"
+    echo "==> DEBUG: dnsmasq log:"
+    cat .nixbox/run/dnsmasq.log 2>/dev/null || echo "(no dnsmasq.log)"
     echo "==> DEBUG: network interfaces:"
     ip addr show 2>/dev/null | grep -A2 'vm\|tap' || echo "(no tap devices)"
     echo "==> DEBUG: nftables:"

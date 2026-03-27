@@ -190,8 +190,13 @@ NFTEOF
                 "--dhcp-range=$TAP_GUEST_IP,$TAP_GUEST_IP,infinite" \
                 "--dhcp-option=option:router,$TAP_HOST_IP" \
                 "--dhcp-option=option:dns-server,$TAP_HOST_IP" \
-                "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP" &
+                "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP" \
+                "--dhcp-leasefile=$run_dir/dnsmasq.leases" \
+                2>>"$run_dir/dnsmasq.log" &
             echo $! > "$state_dir/dnsmasq.pid"
+            sleep 0.3
+            kill -0 "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null \
+                || die "dnsmasq failed to start (see $run_dir/dnsmasq.log)"
             ;;
         filtered)
             log_sub "Mode: filtered (domain allowlist)"
@@ -204,14 +209,18 @@ NFTEOF
                 "--dhcp-option=option:router,$TAP_HOST_IP"
                 "--dhcp-option=option:dns-server,$TAP_HOST_IP"
                 "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP"
+                "--dhcp-leasefile=$run_dir/dnsmasq.leases"
             )
             while IFS= read -r domain; do
                 [ -z "$domain" ] && continue
                 domain="${domain#\*.}"
                 dnsmasq_args+=("--server=/$domain/127.0.0.53")
             done < "$domains_file"
-            sudo dnsmasq "${dnsmasq_args[@]}" &
+            sudo dnsmasq "${dnsmasq_args[@]}" 2>>"$run_dir/dnsmasq.log" &
             echo $! > "$state_dir/dnsmasq.pid"
+            sleep 0.3
+            kill -0 "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null \
+                || die "dnsmasq failed to start (see $run_dir/dnsmasq.log)"
 
             local ports_rule=""
             [ -n "$allowed_ports" ] && \
@@ -254,8 +263,13 @@ NFTEOF
                 "--dhcp-range=$TAP_GUEST_IP,$TAP_GUEST_IP,infinite" \
                 "--dhcp-option=option:router,$TAP_HOST_IP" \
                 "--dhcp-option=option:dns-server,$TAP_HOST_IP" \
-                "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP" &
+                "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP" \
+                "--dhcp-leasefile=$run_dir/dnsmasq.leases" \
+                2>>"$run_dir/dnsmasq.log" &
             echo $! > "$state_dir/dnsmasq.pid"
+            sleep 0.3
+            kill -0 "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null \
+                || die "dnsmasq failed to start (see $run_dir/dnsmasq.log)"
             sudo nft -f - <<NFTEOF
 table inet $NFT_TABLE {
     chain forward {
