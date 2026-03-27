@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Minimal E2E test: init → build → boot → SSH → teardown.
+# Requires KVM, sudo, and all nixbox runtime dependencies.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TEST_DIR="$(mktemp -d)"
+
+# Build the Nix-packaged CLI (includes all wrapped deps: virtiofsd, jq, etc.)
+echo "==> Building nixbox CLI..."
+NIXBOX_CLI="$(nix build "$PROJECT_ROOT#nixbox" --no-link --print-out-paths)/bin/nixbox"
+
+dump_debug() {
+    echo "==> DEBUG: vm.log (last 50 lines):"
+    tail -50 .nixbox/run/vm.log 2>/dev/null || echo "(no vm.log)"
+    echo "==> DEBUG: dnsmasq status:"
+    cat .nixbox/state/dnsmasq.pid 2>/dev/null && ps -p "$(cat .nixbox/state/dnsmasq.pid 2>/dev/null)" 2>/dev/null || echo "(no dnsmasq)"
+    echo "==> DEBUG: dnsmasq log:"
+    cat .nixbox/run/dnsmasq.log 2>/dev/null || echo "(no dnsmasq.log)"
+    echo "==> DEBUG: network interfaces:"
+    ip addr show 2>/dev/null | grep -A2 'vm\|tap' || echo "(no tap devices)"
+    echo "==> DEBUG: nftables:"
+    sudo nft list ruleset 2>/dev/null | head -30 || echo "(no rules)"
+    echo "==> DEBUG: ping guest:"
+    local guest_ip
+    guest_ip=$(cat .nixbox/state/guest_ip 2>/dev/null || echo "172.16.0.2")
+    ping -c1 -W2 "$guest_ip" 2>&1 || true
+}
+
+cleanup() {
+    echo "==> Cleanup..."
+    "$NIXBOX_CLI" down 2>/dev/null || true
+    chmod -R u+w "$TEST_DIR" 2>/dev/null || true
+    rm -rf "$TEST_DIR"
+}
+trap cleanup EXIT
+
+echo "==> Creating test project in $TEST_DIR"
+cd "$TEST_DIR"
+"$NIXBOX_CLI" init
+
+# Overwrite template config with minimal test config
+rm -f .nixbox/config.nix
+cat > .nixbox/config.nix <<'NIX'
+{
+  name = "e2e-test";
+  network.mode = "open";
+}
+NIX
+
+echo "==> Building VM runner..."
+"$NIXBOX_CLI" build
+
+echo "==> Starting VM..."
+"$NIXBOX_CLI" up || { dump_debug; exit 1; }
+
+echo "==> Testing SSH command execution..."
+output=$("$NIXBOX_CLI" run "echo hello-from-vm")
+if [ "$output" = "hello-from-vm" ]; then
+    echo "  ok: command execution"
+else
+    echo "  FAIL: expected 'hello-from-vm', got '$output'"
+    exit 1
+fi
+
+echo "==> Testing network connectivity from VM..."
+"$NIXBOX_CLI" run "curl -sf --max-time 10 https://cache.nixos.org >/dev/null"
+echo "  ok: network connectivity"
+
+echo "==> Shutting down VM..."
+"$NIXBOX_CLI" down
+
+echo ""
+echo "E2E: all checks passed"
