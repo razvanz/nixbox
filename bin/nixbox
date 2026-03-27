@@ -574,6 +574,13 @@ NFTEOF
         die "SSH not ready after 60s"
     fi
 
+    # --- Inject VM SSH key for outbound connections (e.g. GitHub) ---
+    log "==> Injecting SSH identity..."
+    ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+    scp -q "${SSH_OPTS[@]}" "$SSH_KEY" "${VM_USER}@${TAP_GUEST_IP}:~/.ssh/id_ed25519"
+    ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "chmod 600 ~/.ssh/id_ed25519"
+    log_sub "SSH key: $(cat "${SSH_KEY}.pub")"
+
     # --- Mount virtiofs inside guest ---
     if [ "$mount_count" -gt 0 ]; then
         for i in $(seq 0 $((mount_count - 1))); do
