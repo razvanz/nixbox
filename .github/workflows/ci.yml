@@ -36,7 +36,7 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: nix-community/cache-nix-action@v6
         with:
-          primary-key: nix-e2e-${{ hashFiles('flake.lock') }}
+          primary-key: nix-e2e-${{ hashFiles('flake.lock', 'flake.nix') }}
           restore-prefixes-first-match: nix-e2e-
       - name: Install runtime deps
         run: |

@@ -21,7 +21,9 @@ dump_debug() {
     echo "==> DEBUG: nftables:"
     sudo nft list ruleset 2>/dev/null | head -30 || echo "(no rules)"
     echo "==> DEBUG: ping guest:"
-    ping -c1 -W2 172.16.0.2 2>&1 || true
+    local guest_ip
+    guest_ip=$(cat .nixbox/state/guest_ip 2>/dev/null || echo "172.16.0.2")
+    ping -c1 -W2 "$guest_ip" 2>&1 || true
 }
 
 cleanup() {
