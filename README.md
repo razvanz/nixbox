@@ -95,6 +95,25 @@ Three modes controlled by `network.mode`:
 
 Base domains (`nixos.org`) are always included. Plugin domains are merged automatically. Your `network.domains` adds on top of both.
 
+## SSH Identity
+
+Each VM has a stable SSH key pair at `.nixbox/ssh/vm_key{,.pub}`, generated once on first `nixbox up`. The private key is injected into `~/.ssh/id_ed25519` inside the guest, so the VM can authenticate to GitHub and other SSH hosts using its own identity.
+
+To authorize the VM on GitHub, add the public key once:
+
+```bash
+# Print the public key
+cat .nixbox/ssh/vm_key.pub
+
+# Add as a personal SSH key (full access)
+# → paste into github.com/settings/ssh/new
+
+# Or add as a repo deploy key (scoped access)
+gh repo deploy-key add .nixbox/ssh/vm_key.pub --allow-write -t nixbox
+```
+
+The key is stable across VM restarts — it's only regenerated if `.nixbox/ssh/vm_key` is deleted.
+
 ## Credentials
 
 Secrets are passed via the `env` attrset. Use `builtins.getEnv` to read from host environment so the file stays safe to commit:
