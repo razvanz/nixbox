@@ -12,20 +12,14 @@ echo "==> Building nixbox CLI..."
 NIXBOX_CLI="$(nix build "$PROJECT_ROOT#nixbox" --no-link --print-out-paths)/bin/nixbox"
 
 dump_debug() {
+    echo "==> DEBUG: pre-cleanup diagnosis (ping/leases/tap/nft):"
+    cat .nixbox/run/ssh-fail-diag.log 2>/dev/null || echo "(no ssh-fail-diag.log)"
     echo "==> DEBUG: vm.log (last 50 lines):"
     tail -50 .nixbox/run/vm.log 2>/dev/null || echo "(no vm.log)"
-    echo "==> DEBUG: dnsmasq status:"
-    cat .nixbox/state/dnsmasq.pid 2>/dev/null && ps -p "$(cat .nixbox/state/dnsmasq.pid 2>/dev/null)" 2>/dev/null || echo "(no dnsmasq)"
-    echo "==> DEBUG: dnsmasq log:"
-    cat .nixbox/run/dnsmasq.log 2>/dev/null || echo "(no dnsmasq.log)"
-    echo "==> DEBUG: network interfaces:"
-    ip addr show 2>/dev/null | grep -A2 'vm\|tap' || echo "(no tap devices)"
-    echo "==> DEBUG: nftables:"
-    sudo nft list ruleset 2>/dev/null | head -30 || echo "(no rules)"
-    echo "==> DEBUG: ping guest:"
-    local guest_ip
-    guest_ip=$(cat .nixbox/state/guest_ip 2>/dev/null || echo "172.16.0.2")
-    ping -c1 -W2 "$guest_ip" 2>&1 || true
+    echo "==> DEBUG: dnsmasq log (last 30 lines):"
+    tail -30 .nixbox/run/dnsmasq.log 2>/dev/null || echo "(no dnsmasq.log)"
+    echo "==> DEBUG: SSH wait errors (last 5 lines):"
+    tail -5 .nixbox/run/ssh-wait.log 2>/dev/null || echo "(no ssh-wait.log)"
 }
 
 cleanup() {

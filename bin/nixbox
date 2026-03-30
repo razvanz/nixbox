@@ -192,6 +192,7 @@ NFTEOF
                 "--dhcp-option=option:dns-server,$TAP_HOST_IP" \
                 "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP" \
                 "--dhcp-leasefile=$run_dir/dnsmasq.leases" \
+                --log-facility=- --log-dhcp \
                 2>>"$run_dir/dnsmasq.log" &
             echo $! > "$state_dir/dnsmasq.pid"
             sleep 0.3
@@ -210,6 +211,7 @@ NFTEOF
                 "--dhcp-option=option:dns-server,$TAP_HOST_IP"
                 "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP"
                 "--dhcp-leasefile=$run_dir/dnsmasq.leases"
+                --log-facility=- --log-dhcp
             )
             while IFS= read -r domain; do
                 [ -z "$domain" ] && continue
@@ -265,6 +267,7 @@ NFTEOF
                 "--dhcp-option=option:dns-server,$TAP_HOST_IP" \
                 "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP" \
                 "--dhcp-leasefile=$run_dir/dnsmasq.leases" \
+                --log-facility=- --log-dhcp \
                 2>>"$run_dir/dnsmasq.log" &
             echo $! > "$state_dir/dnsmasq.pid"
             sleep 0.3
@@ -398,12 +401,23 @@ NFTEOF
     local ssh_timeout="${NIXBOX_SSH_TIMEOUT:-120}"
     log "==> Waiting for SSH readiness..."
     for _ in $(seq 1 "$ssh_timeout"); do
-        if ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 ${VM_USER}@"$TAP_GUEST_IP" "true" 2>/dev/null; then
+        if ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 ${VM_USER}@"$TAP_GUEST_IP" "true" 2>>"$run_dir/ssh-wait.log"; then
             break
         fi
         sleep 1
     done
-    if ! ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 ${VM_USER}@"$TAP_GUEST_IP" "true" 2>/dev/null; then
+    if ! ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 ${VM_USER}@"$TAP_GUEST_IP" "true" 2>>"$run_dir/ssh-wait.log"; then
+        # Save pre-cleanup diagnostics before do_destroy wipes state
+        {
+            echo "=== Ping test ==="
+            ping -c1 -W1 "$TAP_GUEST_IP" 2>&1 || true
+            echo "=== dnsmasq leases ==="
+            cat "$run_dir/dnsmasq.leases" 2>/dev/null || echo "(no leases)"
+            echo "=== TAP state ==="
+            ip addr show "$TAP_DEV" 2>&1 || echo "(no TAP)"
+            echo "=== nftables (nixbox table) ==="
+            sudo nft list table inet "$NFT_TABLE" 2>/dev/null || echo "(no nixbox table)"
+        } > "$run_dir/ssh-fail-diag.log" 2>&1
         die "SSH not ready after ${ssh_timeout}s"
     fi
 
