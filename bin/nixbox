@@ -114,7 +114,7 @@ do_create() {
     local network vcpus mem_mb
     network=$(jq_field '.network.mode')
     vcpus=$(jq_field '.resources.vcpus')
-    [ "$vcpus" -eq 0 ] && vcpus=$(nproc)
+    if [ "$vcpus" -eq 0 ]; then vcpus=$(( $(nproc) / 2 )); [ "$vcpus" -lt 1 ] && vcpus=1; fi
     mem_mb=$(jq_field '.resources.memoryMB')
     if [ "$mem_mb" -eq 0 ]; then
         mem_mb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 2 / 1024 ))
