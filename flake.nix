@@ -150,13 +150,16 @@
 
               # --- Networking ---
 
-              # Use traditional interface names (eth0) instead of predictable names (enp0s*)
-              boot.kernelParams = [ "net.ifnames=0" ];
-
               networking = {
                 hostName = "nixbox";
                 firewall.enable = false;
-                useDHCP = true;
+                useNetworkd = true;
+              };
+
+              # Match all Ethernet NICs regardless of name (virtio-net may not be eth0)
+              systemd.network.networks."10-vm" = {
+                matchConfig.Type = "ether";
+                networkConfig.DHCP = "ipv4";
               };
 
               # --- systemd: Inject environment from host via hot-plugged disk ---
