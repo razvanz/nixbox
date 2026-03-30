@@ -413,10 +413,12 @@ NFTEOF
             ping -c1 -W1 "$TAP_GUEST_IP" 2>&1 || true
             echo "=== dnsmasq leases ==="
             cat "$run_dir/dnsmasq.leases" 2>/dev/null || echo "(no leases)"
-            echo "=== TAP state ==="
-            ip addr show "$TAP_DEV" 2>&1 || echo "(no TAP)"
-            echo "=== nftables (nixbox table) ==="
-            sudo nft list table inet "$NFT_TABLE" 2>/dev/null || echo "(no nixbox table)"
+            echo "=== TAP traffic counters ==="
+            ip -s link show "$TAP_DEV" 2>&1 || echo "(no TAP)"
+            echo "=== iptables INPUT chain ==="
+            sudo iptables -L INPUT -n -v 2>&1 || echo "(no iptables)"
+            echo "=== nftables full ruleset ==="
+            sudo nft list ruleset 2>/dev/null || echo "(no rules)"
         } > "$run_dir/ssh-fail-diag.log" 2>&1
         die "SSH not ready after ${ssh_timeout}s"
     fi

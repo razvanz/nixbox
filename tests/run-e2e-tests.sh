@@ -12,12 +12,12 @@ echo "==> Building nixbox CLI..."
 NIXBOX_CLI="$(nix build "$PROJECT_ROOT#nixbox" --no-link --print-out-paths)/bin/nixbox"
 
 dump_debug() {
-    echo "==> DEBUG: pre-cleanup diagnosis (ping/leases/tap/nft):"
+    echo "==> DEBUG: pre-cleanup diagnosis:"
     cat .nixbox/run/ssh-fail-diag.log 2>/dev/null || echo "(no ssh-fail-diag.log)"
-    echo "==> DEBUG: vm.log (last 50 lines):"
-    tail -50 .nixbox/run/vm.log 2>/dev/null || echo "(no vm.log)"
-    echo "==> DEBUG: dnsmasq log (last 30 lines):"
-    tail -30 .nixbox/run/dnsmasq.log 2>/dev/null || echo "(no dnsmasq.log)"
+    echo "==> DEBUG: vm.log (first 30 lines — networking):"
+    head -30 .nixbox/run/vm.log 2>/dev/null || echo "(no vm.log)"
+    echo "==> DEBUG: dnsmasq log:"
+    cat .nixbox/run/dnsmasq.log 2>/dev/null || echo "(no dnsmasq.log)"
     echo "==> DEBUG: SSH wait errors (last 5 lines):"
     tail -5 .nixbox/run/ssh-wait.log 2>/dev/null || echo "(no ssh-wait.log)"
 }
