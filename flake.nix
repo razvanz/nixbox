@@ -156,8 +156,7 @@
               networking = {
                 hostName = "nixbox";
                 firewall.enable = false;
-                useDHCP = false;
-                interfaces.eth0.useDHCP = true;
+                useDHCP = true;
               };
 
               # --- systemd: Inject environment from host via hot-plugged disk ---
