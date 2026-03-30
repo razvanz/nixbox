@@ -150,15 +150,17 @@
 
               # --- Networking ---
 
+              # net.ifnames=0 ensures the virtio-net NIC is always named eth0
+              boot.kernelParams = [ "net.ifnames=0" ];
+
               networking = {
                 hostName = "nixbox";
                 firewall.enable = false;
                 useNetworkd = true;
               };
 
-              # Match all Ethernet NICs regardless of name (virtio-net may not be eth0)
               systemd.network.networks."10-vm" = {
-                matchConfig.Type = "ether";
+                matchConfig.Name = "eth0";
                 networkConfig.DHCP = "ipv4";
               };
 
