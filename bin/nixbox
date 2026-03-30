@@ -159,8 +159,13 @@ do_create() {
     rm -rf "$env_dir"
 
     # --- Create TAP device ---
+    # Use multi_queue only when vcpus > 2; cloud-hypervisor uses IFF_MULTI_QUEUE
+    # iff num_queues > 2, and opening a multi_queue TAP without IFF_MULTI_QUEUE fails.
     log "==> Configuring network..."
-    sudo ip tuntap add dev "$TAP_DEV" mode tap multi_queue user "$(whoami)"
+    local mq_flag=""
+    [ "$vcpus" -gt 2 ] && mq_flag="multi_queue"
+    # shellcheck disable=SC2086
+    sudo ip tuntap add dev "$TAP_DEV" mode tap $mq_flag user "$(whoami)"
     sudo ip addr add "$TAP_CIDR" dev "$TAP_DEV"
     sudo ip link set "$TAP_DEV" up
 
