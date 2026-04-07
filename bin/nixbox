@@ -899,6 +899,8 @@ ensure_setup() {
 _nix_system() {
     local arch
     arch="$(uname -m)"
+    # Nix uses "aarch64", Apple tools report "arm64"
+    [ "$arch" = "arm64" ] && arch="aarch64"
     if [ "$NIXBOX_PLATFORM" = "darwin" ]; then
         echo "${arch}-darwin"
     else
