@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: ShellCheck
+        run: nix shell nixpkgs#shellcheck -c shellcheck -x -S warning bin/nixbox lib/functions.bash plugins/*/commands/*.sh plugins/*/scripts/*.sh
+      - name: BATS unit tests
+        run: nix shell nixpkgs#bats -c bash tests/run-unit-tests.sh
+      - name: Nix eval tests
+        run: bash tests/run-nix-tests.sh
+
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-e2e-${{ hashFiles('flake.lock', 'flake.nix') }}
+          restore-prefixes-first-match: nix-e2e-
+      - name: Install runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dnsmasq-base nftables
+      - name: E2E test
+        run: |
+          git config --global user.email "ci@nixbox"
+          git config --global user.name "nixbox-ci"
+          bash tests/run-e2e-tests.sh

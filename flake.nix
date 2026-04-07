@@ -150,14 +150,18 @@
 
               # --- Networking ---
 
-              # Use traditional interface names (eth0) instead of predictable names (enp0s*)
+              # net.ifnames=0 ensures the virtio-net NIC is always named eth0
               boot.kernelParams = [ "net.ifnames=0" ];
 
               networking = {
                 hostName = "nixbox";
                 firewall.enable = false;
-                useDHCP = false;
-                interfaces.eth0.useDHCP = true;
+                useNetworkd = true;
+              };
+
+              systemd.network.networks."10-vm" = {
+                matchConfig.Name = "eth0";
+                networkConfig.DHCP = "ipv4";
               };
 
               # --- systemd: Inject environment from host via hot-plugged disk ---
