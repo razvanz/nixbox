@@ -115,6 +115,7 @@
                         interfaces = [
                           {
                             type = "user";
+                            id = "usernet0";
                             mac = "02:00:00:00:00:01";
                           }
                         ];
