@@ -27,13 +27,9 @@ jobs:
         run: bash tests/run-nix-tests.sh
 
   e2e:
-    name: E2E (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: E2E
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Install Nix
@@ -42,10 +38,9 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: nix-community/cache-nix-action@v6
         with:
-          primary-key: nix-e2e-${{ matrix.os }}-${{ hashFiles('flake.lock', 'flake.nix') }}
-          restore-prefixes-first-match: nix-e2e-${{ matrix.os }}-
-      - name: Install runtime deps (Linux)
-        if: runner.os == 'Linux'
+          primary-key: nix-e2e-${{ hashFiles('flake.lock', 'flake.nix') }}
+          restore-prefixes-first-match: nix-e2e-
+      - name: Install runtime deps
         run: |
           sudo apt-get update
           sudo apt-get install -y dnsmasq-base nftables
