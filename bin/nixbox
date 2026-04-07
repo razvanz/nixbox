@@ -416,8 +416,6 @@ NFTEOF
         {
             echo "=== Ping test ==="
             ping -c1 -W1 "$TAP_GUEST_IP" 2>&1 || true
-            echo "=== dnsmasq leases ==="
-            cat "$run_dir/dnsmasq.leases" 2>/dev/null || echo "(no leases)"
             echo "=== TAP traffic counters ==="
             ip -s link show "$TAP_DEV" 2>&1 || echo "(no TAP)"
             echo "=== Route to guest IP ==="
@@ -427,9 +425,9 @@ NFTEOF
             echo "=== cloud-hypervisor net arg ==="
             grep -E 'net |tap=' "$run_dir/microvm-run" 2>/dev/null | head -3 || echo "(no microvm-run)"
             echo "=== iptables INPUT chain ==="
-            sudo iptables -L INPUT -n -v 2>&1 || echo "(no iptables)"
+            sudo -n iptables -L INPUT -n -v 2>&1 || echo "(no iptables)"
             echo "=== nftables full ruleset ==="
-            sudo nft list ruleset 2>/dev/null || echo "(no rules)"
+            sudo -n nft list ruleset 2>/dev/null || echo "(no rules)"
         } > "$run_dir/ssh-fail-diag.log" 2>&1
         die "SSH not ready after ${ssh_timeout}s"
     fi
