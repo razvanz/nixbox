@@ -184,6 +184,8 @@ init_nixbox_dir() {
 init_nixbox_dir_or_active() {
     if NIXBOX_DIR="$(find_nixbox_dir 2>/dev/null)"; then
         :
+    elif [ "${NIXBOX_PLATFORM:-linux}" = "darwin" ] && [ -f "$ACTIVE_FILE" ]; then
+        NIXBOX_DIR="$(cat "$ACTIVE_FILE")"
     else
         local running=()
         mkdir -p "$SLOTS_DIR"
@@ -210,12 +212,34 @@ init_nixbox_dir_or_active() {
     SSH_KEY="$NIXBOX_DIR/ssh/vm_key"
     SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i "$SSH_KEY")
 
-    # Derive network from persisted slot
-    local vm_slot
-    vm_slot=$(cat "$NIXBOX_DIR/state/slot" 2>/dev/null || echo "0")
-    local name
-    name=$(cat "$NIXBOX_DIR/state/name" 2>/dev/null || basename "$(dirname "$NIXBOX_DIR")")
-    derive_network "$vm_slot" "$name"
+    # Derive network from persisted slot (Linux only)
+    if [ "${NIXBOX_PLATFORM:-linux}" != "darwin" ]; then
+        local vm_slot
+        vm_slot=$(cat "$NIXBOX_DIR/state/slot" 2>/dev/null || echo "0")
+        local name
+        name=$(cat "$NIXBOX_DIR/state/name" 2>/dev/null || basename "$(dirname "$NIXBOX_DIR")")
+        derive_network "$vm_slot" "$name"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Darwin: single-VM conflict guard
+# ---------------------------------------------------------------------------
+
+check_no_conflicting_vm() {
+    if [ -f "$ACTIVE_FILE" ]; then
+        local active_nixbox_dir
+        active_nixbox_dir=$(cat "$ACTIVE_FILE")
+        if [ "$active_nixbox_dir" != "$NIXBOX_DIR" ]; then
+            local pid_file="${active_nixbox_dir}/state/pid"
+            if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                local active_name
+                active_name=$(basename "$(dirname "$active_nixbox_dir")")
+                die "VM for '${active_name}' ($(dirname "$active_nixbox_dir")) is running. Run 'nixbox down' there first."
+            fi
+            rm -f "$ACTIVE_FILE"
+        fi
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -224,6 +248,8 @@ init_nixbox_dir_or_active() {
 
 compute_build_hash() {
     local config_path="$1"
+    local hash_cmd="sha256sum"
+    command -v sha256sum &>/dev/null || hash_cmd="shasum -a 256"
     (
         cat "$NIXBOX_SRC/flake.nix" \
             "$NIXBOX_SRC/flake.lock" \
@@ -231,5 +257,5 @@ compute_build_hash() {
             "$config_path" \
             "$NIXBOX_DIR/ssh/vm_key.pub"
         find "$NIXBOX_SRC/plugins" -name '*.nix' -exec cat {} + 2>/dev/null || true
-    ) | sha256sum | cut -d' ' -f1
+    ) | $hash_cmd | cut -d' ' -f1
 }

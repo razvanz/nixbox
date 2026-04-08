@@ -1,6 +1,6 @@
 # nixbox
 
-Cloud-hypervisor microVM sandbox for running AI agents (eg: Claude Code with `--dangerously-skip-permissions`) in full isolation. Host protected by KVM boundary + egress filtering. Directories shared via virtiofs bind mounts.
+MicroVM sandbox for running AI agents (eg: Claude Code with `--dangerously-skip-permissions`) in full isolation. Host protected by hypervisor boundary + egress filtering. Directories shared via virtiofs bind mounts. Supports Linux (cloud-hypervisor) and macOS on Apple Silicon (vfkit / Virtualization.framework).
 
 Multiple VMs can run concurrently (up to 64), each with isolated slot-based networking. Mount your entire workspace (e.g. `~/workspace`) rather than a single project — this lets you switch between projects inside the VM without restarting it.
 
@@ -15,9 +15,17 @@ Multiple VMs can run concurrently (up to 64), each with isolated slot-based netw
 
 ## Prerequisites
 
-- Linux with KVM (`/dev/kvm`)
+### Linux
+
+- KVM (`/dev/kvm`)
 - [Nix](https://nixos.org/download/) with flakes enabled
 - `dnsmasq`, `nftables`, `e2fsprogs` (for `mke2fs`), `virtiofsd`
+
+### macOS (Apple Silicon)
+
+- macOS 13+ (Ventura) with Virtualization.framework
+- [Nix](https://nixos.org/download/) with flakes enabled
+- `e2fsprogs` (for `mke2fs`)
 
 ## Install
 
@@ -249,6 +257,14 @@ The JDK is specified separately via `nix.packages` so you control the version. S
 
 - **Concurrent VMs** — up to 64 concurrent VMs supported, each with per-VM network isolation via slot-based IP allocation.
 - **virtiofs + `O_TMPFILE`** — virtiofs does not support `O_TMPFILE`. Tools that hit this (e.g. Node.js/Claude Code) need tmpfs overlays on affected dirs — the `claude-code` plugin handles this automatically.
+
+### macOS-specific limitations
+
+- **Network filtering** — `filtered` mode is not yet implemented on macOS. Only `open` mode works; `off` and `filtered` will error.
+- **Hot-plug mounts** — `nixbox mount` / `nixbox unmount` are not supported. Declare mounts in `config.nix` and restart the VM.
+- **Guest IP discovery** — uses ARP scan after boot instead of static assignment. Boot may be slightly slower.
+
+See [ADR 015](docs/decisions/015-macos-vfkit-support.md) for full platform comparison.
 
 ## Acknowledgments
 
