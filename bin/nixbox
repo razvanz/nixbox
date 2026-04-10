@@ -708,6 +708,32 @@ EOF
     echo "Edit .nixbox/config.nix, then run 'nixbox up'."
 }
 
+cmd_update() {
+    # Ensure we're running from a writable source checkout, not a Nix store install
+    if ! [ -w "$NIXBOX_SRC/flake.lock" ]; then
+        die "Cannot update: nixbox is installed read-only ($NIXBOX_SRC). Run from a git checkout instead."
+    fi
+
+    log "==> Updating flake inputs..."
+    (cd "$NIXBOX_SRC" && nix flake update)
+    log "==> Flake inputs updated."
+
+    # Invalidate build hash so next 'up' triggers a rebuild
+    if [ -d "${NIXBOX_DIR:-}" ] && [ -f "$NIXBOX_DIR/state/.build-hash" ]; then
+        rm -f "$NIXBOX_DIR/state/.build-hash"
+        log "    Build cache invalidated for $(basename "$NIXBOX_DIR/..")."
+    fi
+
+    # Warn if a VM is running
+    if [ -f "${NIXBOX_DIR:-}/state/pid" ]; then
+        local pid
+        pid=$(cat "$NIXBOX_DIR/state/pid")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "    NOTE: VM is running (PID $pid). Run 'nixbox down && nixbox up' to pick up the changes."
+        fi
+    fi
+}
+
 cmd_build() {
     init_nixbox_dir
     local config_path="$NIXBOX_DIR/config.nix"
@@ -875,6 +901,7 @@ cmd_doctor() {
 case "${1:-}" in
     setup)       shift; cmd_setup "$@" ;;
     init)        shift; cmd_init "$@" ;;
+    update)      shift; cmd_update "$@" ;;
     build)       shift; cmd_build "$@" ;;
     up)          shift; cmd_up "$@" ;;
     down)        shift; cmd_down "$@" ;;
@@ -901,6 +928,7 @@ Commands:
     config        Print resolved project config
     doctor        Check prerequisites and config
     setup         Run one-time setup manually
+    update        Update flake inputs (nixpkgs, etc.)
     build [-f]    Build VM runner manually (-f to force)
 
 Plugin commands:
