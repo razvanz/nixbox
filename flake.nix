@@ -94,6 +94,11 @@
                 ];
               };
 
+              # Workaround: nixpkgs removed the default fsType="auto" (NixOS/nixpkgs#444829)
+              # and microvm.nix's bind mount for /nix/store doesn't set it (astro/microvm.nix#500).
+              # Remove once microvm.nix merges astro/microvm.nix#502.
+              fileSystems."/nix/store".fsType = lib.mkDefault "none";
+
               # --- Packages ---
 
               environment.systemPackages =

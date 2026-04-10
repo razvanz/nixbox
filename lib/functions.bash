@@ -224,12 +224,18 @@ init_nixbox_dir_or_active() {
 
 compute_build_hash() {
     local config_path="$1"
+    local lock_file="$NIXBOX_DIR/flake.lock"
     (
         cat "$NIXBOX_SRC/flake.nix" \
-            "$NIXBOX_SRC/flake.lock" \
             "$NIXBOX_SRC/lib/resolve.nix" \
             "$config_path" \
             "$NIXBOX_DIR/ssh/vm_key.pub"
+        # Include user's pinned lock if present; its absence changes the hash
+        if [ -f "$lock_file" ]; then
+            cat "$lock_file"
+        else
+            echo "__no_lock__"
+        fi
         find "$NIXBOX_SRC/plugins" -name '*.nix' -exec cat {} + 2>/dev/null || true
     ) | sha256sum | cut -d' ' -f1
 }
