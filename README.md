@@ -82,7 +82,7 @@ See `config.example.nix` for all fields.
 | `nixbox config` | Print resolved project config |
 | `nixbox doctor` | Check prerequisites and config |
 | `nixbox setup` | Run one-time setup manually |
-| `nixbox update` | Update flake inputs (nixpkgs, microvm.nix, etc.) |
+| `nixbox update` | Update all packages to latest versions |
 | `nixbox build [-f]` | Build VM runner manually (`-f` to force) |
 | `nixbox <plugin> <cmd>` | Run a plugin command (e.g. `nixbox aws login`) |
 
@@ -250,6 +250,7 @@ The JDK is specified separately via `nix.packages` so you control the version. S
 
 - **Concurrent VMs** — up to 64 concurrent VMs supported, each with per-VM network isolation via slot-based IP allocation.
 - **virtiofs + `O_TMPFILE`** — virtiofs does not support `O_TMPFILE`. Tools that hit this (e.g. Node.js/Claude Code) need tmpfs overlays on affected dirs — the `claude-code` plugin handles this automatically.
+- **Claude Code conversations** — Claude Code stores conversations under `~/.claude/projects/` keyed by the workspace's absolute path. Since the workspace path differs between host and guest (e.g. `/home/you/workspace` vs `/home/vmuser/workspace`), conversations don't carry over between the two. Workaround: symlink the guest-side conversation directory to the host's.
 
 ## Acknowledgments
 

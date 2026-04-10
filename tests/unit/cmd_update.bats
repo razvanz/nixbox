@@ -1,60 +1,88 @@
 #!/usr/bin/env bats
 
-# Tests for cmd_update logic.
-# We can't call cmd_update directly (it lives in bin/nixbox and shells out to
-# nix), so we test the constituent checks: read-only guard, build-hash
-# invalidation, and running-VM detection.
+# Tests for the update command's constituent logic:
+# - compute_build_hash includes/excludes .nixbox/flake.lock
+# - build hash + lock invalidation
+# - running VM detection
 
 load test_helper
 
 setup() {
     setup_temp_dirs
     NIXBOX_SRC="$TEST_TMPDIR/src"
-    mkdir -p "$NIXBOX_SRC"
-    touch "$NIXBOX_SRC/flake.lock"
-    chmod u+w "$NIXBOX_SRC/flake.lock"
+    mkdir -p "$NIXBOX_SRC/lib" "$NIXBOX_SRC/plugins"
+    echo "flake" > "$NIXBOX_SRC/flake.nix"
+    echo "resolve" > "$NIXBOX_SRC/lib/resolve.nix"
 
     NIXBOX_DIR="$TEST_TMPDIR/project/.nixbox"
-    mkdir -p "$NIXBOX_DIR/state"
+    mkdir -p "$NIXBOX_DIR/state" "$NIXBOX_DIR/ssh"
+    echo "config" > "$NIXBOX_DIR/config.nix"
+    echo "pubkey" > "$NIXBOX_DIR/ssh/vm_key.pub"
 }
 
 teardown() {
     teardown_temp_dirs
 }
 
-# --- Read-only guard ---
+# --- Build hash with/without lock ---
 
-@test "update rejects read-only source dir" {
-    chmod a-w "$NIXBOX_SRC/flake.lock"
-    run bash -c '[ -w "'"$NIXBOX_SRC/flake.lock"'" ]'
-    [ "$status" -ne 0 ]
+@test "build hash changes when flake.lock is added" {
+    local hash_without hash_with
+    hash_without=$(compute_build_hash "$NIXBOX_DIR/config.nix")
+
+    echo '{"nodes":{}}' > "$NIXBOX_DIR/flake.lock"
+    hash_with=$(compute_build_hash "$NIXBOX_DIR/config.nix")
+
+    [ "$hash_without" != "$hash_with" ]
 }
 
-@test "update accepts writable source dir" {
-    run bash -c '[ -w "'"$NIXBOX_SRC/flake.lock"'" ]'
-    [ "$status" -eq 0 ]
+@test "build hash is stable with same lock" {
+    echo '{"nodes":{}}' > "$NIXBOX_DIR/flake.lock"
+    local hash1 hash2
+    hash1=$(compute_build_hash "$NIXBOX_DIR/config.nix")
+    hash2=$(compute_build_hash "$NIXBOX_DIR/config.nix")
+    [ "$hash1" = "$hash2" ]
 }
 
-# --- Build hash invalidation ---
+@test "build hash changes when lock content changes" {
+    echo '{"nodes":{"v1":{}}}' > "$NIXBOX_DIR/flake.lock"
+    local hash1
+    hash1=$(compute_build_hash "$NIXBOX_DIR/config.nix")
 
-@test "update invalidates build hash when present" {
+    echo '{"nodes":{"v2":{}}}' > "$NIXBOX_DIR/flake.lock"
+    local hash2
+    hash2=$(compute_build_hash "$NIXBOX_DIR/config.nix")
+
+    [ "$hash1" != "$hash2" ]
+}
+
+@test "removing lock restores original hash" {
+    local hash_before
+    hash_before=$(compute_build_hash "$NIXBOX_DIR/config.nix")
+
+    echo '{"nodes":{}}' > "$NIXBOX_DIR/flake.lock"
+    rm "$NIXBOX_DIR/flake.lock"
+
+    local hash_after
+    hash_after=$(compute_build_hash "$NIXBOX_DIR/config.nix")
+    [ "$hash_before" = "$hash_after" ]
+}
+
+# --- Lock + build hash invalidation ---
+
+@test "deleting lock and build hash simulates update reset" {
+    echo '{"nodes":{}}' > "$NIXBOX_DIR/flake.lock"
     echo "abc123" > "$NIXBOX_DIR/state/.build-hash"
-    [ -f "$NIXBOX_DIR/state/.build-hash" ]
 
-    rm -f "$NIXBOX_DIR/state/.build-hash"
-    [ ! -f "$NIXBOX_DIR/state/.build-hash" ]
-}
+    rm -f "$NIXBOX_DIR/flake.lock" "$NIXBOX_DIR/state/.build-hash"
 
-@test "update tolerates missing build hash" {
+    [ ! -f "$NIXBOX_DIR/flake.lock" ]
     [ ! -f "$NIXBOX_DIR/state/.build-hash" ]
-    # Should not error
-    rm -f "$NIXBOX_DIR/state/.build-hash"
 }
 
 # --- Running VM detection ---
 
 @test "detects running VM via pid file" {
-    # Use our own PID — guaranteed alive
     echo "$$" > "$NIXBOX_DIR/state/pid"
     run bash -c 'kill -0 "$(cat "'"$NIXBOX_DIR/state/pid"'")" 2>/dev/null'
     [ "$status" -eq 0 ]
@@ -68,6 +96,5 @@ teardown() {
 
 @test "handles missing pid file gracefully" {
     rm -f "$NIXBOX_DIR/state/pid"
-    run bash -c '[ -f "'"$NIXBOX_DIR/state/pid"'" ]'
-    [ "$status" -ne 0 ]
+    [ ! -f "$NIXBOX_DIR/state/pid" ]
 }

@@ -671,17 +671,25 @@ ensure_build() {
     mkdir -p "$build_dir/lib"
 
     cp "$NIXBOX_SRC/flake.nix" "$build_dir/"
-    cp "$NIXBOX_SRC/flake.lock" "$build_dir/"
     cp "$NIXBOX_SRC/lib/resolve.nix" "$build_dir/lib/"
     cp -r "$NIXBOX_SRC/plugins" "$build_dir/"
     cp "$config_path" "$build_dir/project-config.nix"
     cp "$ssh_pub" "$build_dir/ssh_key.pub"
     echo "{ username = \"$VM_USER\"; }" > "$build_dir/host-info.nix"
 
+    # Use project-pinned flake.lock if available; otherwise nix resolves latest
+    local user_lock="$NIXBOX_DIR/flake.lock"
+    if [ -f "$user_lock" ]; then
+        cp "$user_lock" "$build_dir/flake.lock"
+    fi
+
     (cd "$build_dir" && git init -q && git add -A && git commit -q -m "build" --allow-empty)
 
     log "==> Building VM runner..."
     (cd "$build_dir" && nix build .#vm-runner)
+
+    # Persist the resolved flake.lock back to the project
+    cp "$build_dir/flake.lock" "$NIXBOX_DIR/flake.lock"
 
     ln -sfn "$(readlink -f "$build_dir/result")" "$runner"
     echo "$current_hash" > "$hash_file"
@@ -709,23 +717,17 @@ EOF
 }
 
 cmd_update() {
-    # Ensure we're running from a writable source checkout, not a Nix store install
-    if ! [ -w "$NIXBOX_SRC/flake.lock" ]; then
-        die "Cannot update: nixbox is installed read-only ($NIXBOX_SRC). Run from a git checkout instead."
-    fi
+    init_nixbox_dir
+    local config_path="$NIXBOX_DIR/config.nix"
+    ensure_setup
 
-    log "==> Updating flake inputs..."
-    (cd "$NIXBOX_SRC" && nix flake update)
-    log "==> Flake inputs updated."
-
-    # Invalidate build hash so next 'up' triggers a rebuild
-    if [ -d "${NIXBOX_DIR:-}" ] && [ -f "$NIXBOX_DIR/state/.build-hash" ]; then
-        rm -f "$NIXBOX_DIR/state/.build-hash"
-        log "    Build cache invalidated for $(basename "$NIXBOX_DIR/..")."
-    fi
+    log "==> Updating packages..."
+    rm -f "$NIXBOX_DIR/flake.lock"
+    rm -f "$NIXBOX_DIR/state/.build-hash"
+    ensure_build "$config_path"
 
     # Warn if a VM is running
-    if [ -f "${NIXBOX_DIR:-}/state/pid" ]; then
+    if [ -f "$NIXBOX_DIR/state/pid" ]; then
         local pid
         pid=$(cat "$NIXBOX_DIR/state/pid")
         if kill -0 "$pid" 2>/dev/null; then
@@ -928,7 +930,7 @@ Commands:
     config        Print resolved project config
     doctor        Check prerequisites and config
     setup         Run one-time setup manually
-    update        Update flake inputs (nixpkgs, etc.)
+    update        Update all packages to latest versions
     build [-f]    Build VM runner manually (-f to force)
 
 Plugin commands:
