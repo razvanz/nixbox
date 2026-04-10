@@ -82,6 +82,7 @@ See `config.example.nix` for all fields.
 | `nixbox config` | Print resolved project config |
 | `nixbox doctor` | Check prerequisites and config |
 | `nixbox setup` | Run one-time setup manually |
+| `nixbox update` | Update flake inputs (nixpkgs, microvm.nix, etc.) |
 | `nixbox build [-f]` | Build VM runner manually (`-f` to force) |
 | `nixbox <plugin> <cmd>` | Run a plugin command (e.g. `nixbox aws login`) |
 
