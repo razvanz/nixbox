@@ -169,6 +169,9 @@ do_create() {
     sudo ip addr add "$TAP_CIDR" dev "$TAP_DEV"
     sudo ip link set "$TAP_DEV" up
 
+    # Resolve real upstream DNS servers (avoids forwarding to stub 127.0.0.53)
+    mapfile -t _upstream_dns < <(get_upstream_dns_servers)
+
     # --- Network mode ---
     case "$network" in
         off)
@@ -221,7 +224,9 @@ NFTEOF
             while IFS= read -r domain; do
                 [ -z "$domain" ] && continue
                 domain="${domain#\*.}"
-                dnsmasq_args+=("--server=/$domain/127.0.0.53")
+                for _us in "${_upstream_dns[@]}"; do
+                    dnsmasq_args+=("--server=/$domain/$_us")
+                done
             done < "$domains_file"
             sudo dnsmasq "${dnsmasq_args[@]}" 2>>"$run_dir/dnsmasq.log" &
             echo $! > "$state_dir/dnsmasq.pid"
@@ -261,19 +266,22 @@ NFTEOF
             ;;
         open)
             log_sub "Mode: open (all traffic forwarded)"
-            sudo dnsmasq \
-                --no-resolv --no-hosts --bind-interfaces \
-                "--listen-address=$TAP_HOST_IP" \
-                --except-interface=lo \
-                --keep-in-foreground \
-                --server=127.0.0.53 \
-                "--dhcp-range=$TAP_GUEST_IP,$TAP_GUEST_IP,infinite" \
-                "--dhcp-option=option:router,$TAP_HOST_IP" \
-                "--dhcp-option=option:dns-server,$TAP_HOST_IP" \
-                "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP" \
-                --dhcp-leasefile=/dev/null \
-                --log-facility=- --log-dhcp \
-                2>>"$run_dir/dnsmasq.log" &
+            local open_args=(
+                --no-resolv --no-hosts --bind-interfaces
+                "--listen-address=$TAP_HOST_IP"
+                --except-interface=lo
+                --keep-in-foreground
+                "--dhcp-range=$TAP_GUEST_IP,$TAP_GUEST_IP,infinite"
+                "--dhcp-option=option:router,$TAP_HOST_IP"
+                "--dhcp-option=option:dns-server,$TAP_HOST_IP"
+                "--dhcp-host=$TAP_MAC,$TAP_GUEST_IP"
+                --dhcp-leasefile=/dev/null
+                --log-facility=- --log-dhcp
+            )
+            for _us in "${_upstream_dns[@]}"; do
+                open_args+=("--server=$_us")
+            done
+            sudo dnsmasq "${open_args[@]}" 2>>"$run_dir/dnsmasq.log" &
             echo $! > "$state_dir/dnsmasq.pid"
             sleep 0.3
             kill -0 "$(cat "$state_dir/dnsmasq.pid")" 2>/dev/null \

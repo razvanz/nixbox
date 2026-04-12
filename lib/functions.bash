@@ -30,6 +30,27 @@ derive_network() {
     VSOCK_CID=$((3 + slot))
 }
 
+# Returns real upstream DNS server IPs (one per line), excluding loopback/stub
+# addresses. Reads /run/systemd/resolve/resolv.conf (real upstreams, not the
+# systemd-resolved stub at 127.0.0.53) when available, falling back to
+# /etc/resolv.conf. Falls back to 8.8.8.8 / 8.8.4.4 if no real servers found.
+get_upstream_dns_servers() {
+    local resolv_conf="/run/systemd/resolve/resolv.conf"
+    [ -f "$resolv_conf" ] || resolv_conf="/etc/resolv.conf"
+    local servers=()
+    while IFS= read -r line; do
+        [[ "$line" =~ ^nameserver[[:space:]]+([^[:space:]]+) ]] || continue
+        local ip="${BASH_REMATCH[1]}"
+        [[ "$ip" =~ ^127\. ]] && continue
+        [[ "$ip" == "::1" ]] && continue
+        servers+=("$ip")
+    done < "$resolv_conf"
+    if [ ${#servers[@]} -eq 0 ]; then
+        servers=("8.8.8.8" "8.8.4.4")
+    fi
+    printf '%s\n' "${servers[@]}"
+}
+
 # ---------------------------------------------------------------------------
 # Slot management (filesystem-based, uses SLOTS_DIR / BYDIR_DIR)
 # ---------------------------------------------------------------------------
