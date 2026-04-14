@@ -22,7 +22,13 @@ Multiple VMs can run concurrently (up to 64), each with isolated slot-based netw
 ## Install
 
 ```bash
-nix profile install "git+ssh://git@github.com/razvanz/nixbox"
+# Flake
+nix profile install github:razvanz/nixbox
+
+# Or clone + install locally
+git clone https://github.com/razvanz/nixbox.git
+cd nixcage
+nix profile install .
 ```
 
 ## Quick start
