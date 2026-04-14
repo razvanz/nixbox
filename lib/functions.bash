@@ -35,8 +35,11 @@ derive_network() {
 # systemd-resolved stub at 127.0.0.53) when available, falling back to
 # /etc/resolv.conf. Falls back to 8.8.8.8 / 8.8.4.4 if no real servers found.
 get_upstream_dns_servers() {
-    local resolv_conf="/run/systemd/resolve/resolv.conf"
-    [ -f "$resolv_conf" ] || resolv_conf="/etc/resolv.conf"
+    local resolv_conf="${1:-}"
+    if [ -z "$resolv_conf" ]; then
+        resolv_conf="/run/systemd/resolve/resolv.conf"
+        [ -f "$resolv_conf" ] || resolv_conf="/etc/resolv.conf"
+    fi
     local servers=()
     while IFS= read -r line; do
         [[ "$line" =~ ^nameserver[[:space:]]+([^[:space:]]+) ]] || continue

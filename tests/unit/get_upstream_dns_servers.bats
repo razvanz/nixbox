@@ -14,25 +14,7 @@ _run_with_resolv() {
     local content="$1"
     local resolv="$TEST_TMPDIR/resolv.conf"
     printf '%s\n' "$content" > "$resolv"
-    # Override the lookup paths used by get_upstream_dns_servers
-    (
-        # Temporarily shadow the real paths via a wrapper that reads our fixture
-        get_upstream_dns_servers() {
-            local servers=()
-            while IFS= read -r line; do
-                [[ "$line" =~ ^nameserver[[:space:]]+([^[:space:]]+) ]] || continue
-                local ip="${BASH_REMATCH[1]}"
-                [[ "$ip" =~ ^127\. ]] && continue
-                [[ "$ip" == "::1" ]] && continue
-                servers+=("$ip")
-            done < "$resolv"
-            if [ ${#servers[@]} -eq 0 ]; then
-                servers=("8.8.8.8" "8.8.4.4")
-            fi
-            printf '%s\n' "${servers[@]}"
-        }
-        get_upstream_dns_servers
-    )
+    get_upstream_dns_servers "$resolv"
 }
 
 @test "filters out 127.0.0.53 (systemd-resolved stub)" {
