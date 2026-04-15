@@ -23,3 +23,5 @@ Each file: `NNN-short-title.md` with sections **Problem**, **Decision**, **Conse
 | [011](011-guest-setup-scripts.md) | Guest setup via user-provided scripts | 2026-03-24 | accepted |
 | [012](012-per-workspace-nixbox-directory.md) | Per-workspace `.nixbox/` directory | 2026-03-24 | accepted |
 | [013](013-plugin-env-transparency.md) | Plugins must not inject env vars | 2026-03-24 | accepted |
+| [014](014-vm-ssh-key-injection.md) | Inject VM SSH key for outbound authentication | 2026-03-27 | accepted |
+| [015](015-macos-vfkit-support.md) | macOS support via vfkit hypervisor | 2026-04-07 | accepted |
