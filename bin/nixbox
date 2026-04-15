@@ -170,7 +170,9 @@ do_create() {
     sudo ip link set "$TAP_DEV" up
 
     # Resolve real upstream DNS servers (avoids forwarding to stub 127.0.0.53)
-    mapfile -t _upstream_dns < <(get_upstream_dns_servers)
+    local upstream
+    local -a upstream_dns
+    mapfile -t upstream_dns < <(get_upstream_dns_servers)
 
     # --- Network mode ---
     case "$network" in
@@ -224,8 +226,8 @@ NFTEOF
             while IFS= read -r domain; do
                 [ -z "$domain" ] && continue
                 domain="${domain#\*.}"
-                for _us in "${_upstream_dns[@]}"; do
-                    dnsmasq_args+=("--server=/$domain/$_us")
+                for upstream in "${upstream_dns[@]}"; do
+                    dnsmasq_args+=("--server=/$domain/$upstream")
                 done
             done < "$domains_file"
             sudo dnsmasq "${dnsmasq_args[@]}" 2>>"$run_dir/dnsmasq.log" &
@@ -278,8 +280,8 @@ NFTEOF
                 --dhcp-leasefile=/dev/null
                 --log-facility=- --log-dhcp
             )
-            for _us in "${_upstream_dns[@]}"; do
-                open_args+=("--server=$_us")
+            for upstream in "${upstream_dns[@]}"; do
+                open_args+=("--server=$upstream")
             done
             sudo dnsmasq "${open_args[@]}" 2>>"$run_dir/dnsmasq.log" &
             echo $! > "$state_dir/dnsmasq.pid"
