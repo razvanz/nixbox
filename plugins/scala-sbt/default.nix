@@ -9,6 +9,7 @@ in
   nix.packages = [
     "sbt"
     "scala"
+    "scala-cli"
   ];
 
   mounts =
