@@ -49,6 +49,20 @@ echo "==> Building VM runner..."
 echo "==> Starting VM..."
 "$NIXBOX_CLI" up || { dump_debug; exit 1; }
 
+echo "==> Verifying virtiofsd FD limits..."
+for pidfile in .nixbox/state/virtiofsd_*_pid; do
+    [ -f "$pidfile" ] || continue
+    pid=$(cat "$pidfile")
+    tag=$(basename "$pidfile" | sed 's/virtiofsd_//;s/_pid//')
+    max_fds=$(awk '/^Max open files/{print $4}' "/proc/$pid/limits")
+    if [ "$max_fds" -ge 65536 ]; then
+        echo "  ok: virtiofsd ($tag) has $max_fds max FDs"
+    else
+        echo "  FAIL: virtiofsd ($tag) has $max_fds max FDs, expected >= 65536"
+        exit 1
+    fi
+done
+
 echo "==> Testing SSH command execution..."
 output=$("$NIXBOX_CLI" run "echo hello-from-vm")
 if [ "$output" = "hello-from-vm" ]; then
