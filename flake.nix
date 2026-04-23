@@ -120,16 +120,25 @@
               # --- Dynamic linker for generic Linux binaries ---
               # Many dev tools (scala-cli-fetched scalafmt, Node native deps, etc.)
               # ship prebuilt glibc binaries that need /lib64/ld-linux-x86-64.so.2.
+              # Extra libraries can be added via `nix.ldLibraries` in project config
+              # or plugins. Names support dotted paths (e.g. "stdenv.cc.cc.lib").
               programs.nix-ld = {
                 enable = true;
-                libraries = with pkgs; [
-                  stdenv.cc.cc.lib
-                  zlib
-                  openssl
-                  curl
-                  icu
-                  libxcrypt
-                ];
+                libraries =
+                  let
+                    baseLibs = with pkgs; [
+                      stdenv.cc.cc.lib
+                      zlib
+                      openssl
+                      curl
+                      icu
+                      libxcrypt
+                    ];
+                    extraLibs = map (
+                      name: lib.getAttrFromPath (lib.splitString "." name) pkgs
+                    ) ((projectConfig.nix or { }).ldLibraries or [ ]);
+                  in
+                  baseLibs ++ extraLibs;
               };
 
               # --- Environment ---

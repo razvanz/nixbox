@@ -65,6 +65,7 @@ let
   # Base defaults for list/attrset fields
   defaults = {
     nix.packages = [ ];
+    nix.ldLibraries = [ ];
     mounts = [ ];
     network.domains = defaultDomains;
     network.ports = [
@@ -116,6 +117,7 @@ in
   };
   nix = {
     packages = dedup ((merged.nix or { }).packages or [ ]);
+    ldLibraries = dedup ((merged.nix or { }).ldLibraries or [ ]);
   };
   scripts = merged.scripts or [ ];
   env = merged.env or { };

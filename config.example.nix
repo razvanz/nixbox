@@ -40,6 +40,15 @@
   #   "nodejs_22"
   # ];
 
+  # # --- nix-ld libraries ---
+  # # Extra libraries exposed to prebuilt glibc binaries via nix-ld. Appended to
+  # # the baseline (stdenv.cc.cc.lib, zlib, openssl, curl, icu, libxcrypt).
+  # # Names support dotted paths (e.g. "xorg.libX11"). Triggers auto-rebuild.
+  # nix.ldLibraries = [
+  #   "libGL"
+  #   "xorg.libX11"
+  # ];
+
   # # --- Setup scripts ---
   # # Ran inside guest after boot (after plugin scripts), with env vars sourced.
   # scripts = [
