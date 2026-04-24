@@ -135,10 +135,11 @@
                       libxcrypt
                     ];
                     extraLibs = map (
-                      name: lib.getAttrFromPath (lib.splitString "." name) pkgs
+                      name:
+                      lib.attrByPath (lib.splitString "." name) (throw "Invalid nix.ldLibraries entry: ${name} (pkgs attribute path not found)") pkgs
                     ) ((projectConfig.nix or { }).ldLibraries or [ ]);
                   in
-                  baseLibs ++ extraLibs;
+                  lib.lists.unique (baseLibs ++ extraLibs);
               };
 
               # --- Environment ---
