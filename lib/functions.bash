@@ -15,21 +15,34 @@ log_sub() { printf '\r    %s\n' "$*"; }
 # Process limits
 # ---------------------------------------------------------------------------
 
-# Raise the current shell's NOFILE soft+hard limit to $1 (default 524288).
-# virtiofsd with --cache=auto accumulates backing-file FDs and pins hot-cache
-# shares at the ceiling (#18). If the session's hard limit is below target
-# (e.g. locked-down CI runners), sudo prlimit raises the kernel limit first
-# so bash's ulimit can then set the soft limit. Children inherit both.
+# Raise the current shell's NOFILE soft limit to $1 (default 524288) without
+# lowering an already-higher hard limit. virtiofsd with --cache=auto
+# accumulates backing-file FDs and pins hot-cache shares at the ceiling (#18).
+# If the session's hard limit is below target (e.g. locked-down CI runners),
+# sudo prlimit raises this shell process's NOFILE hard+soft limits so bash's
+# ulimit can then succeed. Children inherit both.
 raise_nofile() {
     local target="${1:-524288}"
-    if ulimit -n "$target" 2>/dev/null; then
+    local current_soft current_hard
+
+    current_soft=$(ulimit -Sn) || die "Failed to read NOFILE soft limit"
+    current_hard=$(ulimit -Hn) || die "Failed to read NOFILE hard limit"
+
+    if [ "$current_soft" = "unlimited" ] || [ "$current_soft" -ge "$target" ]; then
         return 0
     fi
+
+    if [ "$current_hard" = "unlimited" ] || [ "$current_hard" -ge "$target" ]; then
+        ulimit -Sn "$target" \
+            || die "Failed to raise NOFILE soft limit to $target"
+        return 0
+    fi
+
     log "==> Raising NOFILE hard limit to $target (requires sudo)..."
-    sudo prlimit --pid $$ --nofile="$target:$target" \
+    sudo prlimit --pid "$BASHPID" --nofile="$target:$target" \
         || die "Failed to raise NOFILE hard limit to $target"
-    ulimit -n "$target" \
-        || die "ulimit -n $target failed after raising hard limit"
+    ulimit -Sn "$target" \
+        || die "Failed to raise NOFILE soft limit to $target after raising hard limit"
 }
 
 # ---------------------------------------------------------------------------
