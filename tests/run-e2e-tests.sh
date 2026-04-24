@@ -55,10 +55,10 @@ for pidfile in .nixbox/state/virtiofsd_*_pid; do
     pid=$(cat "$pidfile")
     tag=$(basename "$pidfile" | sed 's/virtiofsd_//;s/_pid//')
     max_fds=$(awk '/^Max open files/{print $4}' "/proc/$pid/limits")
-    if [ "$max_fds" -ge 65536 ]; then
+    if [ "$max_fds" -ge 524288 ]; then
         echo "  ok: virtiofsd ($tag) has $max_fds max FDs"
     else
-        echo "  FAIL: virtiofsd ($tag) has $max_fds max FDs, expected >= 65536"
+        echo "  FAIL: virtiofsd ($tag) has $max_fds max FDs, expected >= 524288"
         exit 1
     fi
 done
