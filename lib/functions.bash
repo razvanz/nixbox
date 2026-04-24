@@ -12,6 +12,27 @@ log() { printf '\r%s\n' "$*"; }
 log_sub() { printf '\r    %s\n' "$*"; }
 
 # ---------------------------------------------------------------------------
+# Process limits
+# ---------------------------------------------------------------------------
+
+# Raise the current shell's NOFILE soft+hard limit to $1 (default 524288).
+# virtiofsd with --cache=auto accumulates backing-file FDs and pins hot-cache
+# shares at the ceiling (#18). If the session's hard limit is below target
+# (e.g. locked-down CI runners), sudo prlimit raises the kernel limit first
+# so bash's ulimit can then set the soft limit. Children inherit both.
+raise_nofile() {
+    local target="${1:-524288}"
+    if ulimit -n "$target" 2>/dev/null; then
+        return 0
+    fi
+    log "==> Raising NOFILE hard limit to $target (requires sudo)..."
+    sudo prlimit --pid $$ --nofile="$target:$target" \
+        || die "Failed to raise NOFILE hard limit to $target"
+    ulimit -n "$target" \
+        || die "ulimit -n $target failed after raising hard limit"
+}
+
+# ---------------------------------------------------------------------------
 # Network derivation (pure — depends only on slot + name)
 # ---------------------------------------------------------------------------
 

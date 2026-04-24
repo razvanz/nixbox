@@ -310,11 +310,8 @@ NFTEOF
             ;;
     esac
 
-    # Raise FD limit before launching virtiofsd and cloud-hypervisor.
-    # virtiofsd with --cache=auto monotonically accumulates backing-file FDs;
-    # hot caches (coursier, ivy2) can pin thousands per share. 64k was observed
-    # to exhaust under sbt workloads (see #18).
-    ulimit -n 524288
+    # Raise FD limit before launching virtiofsd and cloud-hypervisor (#18).
+    raise_nofile 524288
 
     # --- Start virtiofsd for nix-store share (required by microvm config) ---
     log "==> Starting virtiofsd for nix-store..."
@@ -545,7 +542,7 @@ do_mount() {
     done
 
     local virtiofs_sock="$run_dir/virtiofs-${mount_idx}.sock"
-    ulimit -n 524288
+    raise_nofile 524288
     virtiofsd \
         --socket-path="$virtiofs_sock" \
         --shared-dir="$MOUNT_SOURCE" \
