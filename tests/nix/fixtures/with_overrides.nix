@@ -4,6 +4,7 @@
   network.mode = "filtered";
   network.domains = [ "example.com" ];
   nix.packages = [ "ripgrep" ];
+  nix.ldLibraries = [ "libGL" ];
   mounts = [
     { source = "./src"; target = "~/code"; readonly = true; }
   ];
