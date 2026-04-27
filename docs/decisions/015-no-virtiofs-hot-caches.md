@@ -27,7 +27,7 @@ Reference table for common toolchains:
 
 For tools whose default cache lives under `$HOME`, the simplest implementation is to *not mount* — the default already lands on `root.img`.
 
-Virtiofs continues to be the right choice for source trees and small config directories the user explicitly mounts (`~/.ssh`, `~/.claude`, etc.) — moderate file count with genuine cross-boundary semantics. Credentials use a separate one-shot ext4 disk read at boot (ADR-003), not virtiofs.
+Virtiofs continues to be the right choice for source trees and similar shares with moderate file count where in-place semantics matter (host editor and guest tool reading the same files). Sensitive data uses dedicated explicit channels: credentials via the one-shot ext4 disk (ADR-003), VM SSH identity via per-VM key injection (ADR-014). Plugins that mount additional host state (e.g. claude-code's `~/.claude`, ADR-010) own the tradeoff in their own ADR.
 
 ## Rationale
 
