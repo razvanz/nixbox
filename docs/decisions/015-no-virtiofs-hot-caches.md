@@ -22,6 +22,6 @@ Use virtiofs only where in-place cross-boundary semantics matter (e.g. source tr
 - `plugins/scala-sbt`: warmup via `nixbox scala-sbt warm-cache`. No virtiofs mounts.
 - Host↔guest cache sharing is one-shot, not live: warmup snapshots host state at first boot, then guest and host diverge.
 
-## Future work
+## Possible direction
 
-VM snapshotting would replace the per-workspace warmup with a pre-warmed image; tracked separately.
+VM snapshotting (qcow2 backing or cloud-hypervisor save/restore) could replace the per-workspace warmup with a pre-warmed image. Not committed work — noted as one way this trade-off might be revisited.
