@@ -27,7 +27,7 @@ Reference table for common toolchains:
 
 For tools whose default cache lives under `$HOME`, the simplest implementation is to *not mount* — the default already lands on `root.img`.
 
-Virtiofs continues to be the right choice for source trees, credentials (`~/.env`), small config (`.ssh`, `.claude`), and any cross-boundary share with moderate file count and genuine cross-boundary semantics.
+Virtiofs continues to be the right choice for source trees and small config directories the user explicitly mounts (`~/.ssh`, `~/.claude`, etc.) — moderate file count with genuine cross-boundary semantics. Credentials use a separate one-shot ext4 disk read at boot (ADR-003), not virtiofs.
 
 ## Rationale
 
