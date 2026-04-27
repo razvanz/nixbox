@@ -12,22 +12,25 @@ Scala toolchain with optional private Maven/Nexus credentials.
 
 | Category | Details |
 |---|---|
-| **Packages** | `sbt`, `scala`, `scala-cli`, `rsync` |
+| **Packages** | `sbt`, `scala`, `scala-cli` |
 | **Domains** | `maven.org`, `scala-sbt.org`, plus `MAVEN_REPO_HOST` if set |
+| **Commands** | `nixbox scala-sbt warm-cache` |
 
 ## Caches
 
 Coursier and ivy2 caches live on the guest's `root.img` at default paths
-(`~/.cache/coursier`, `~/.ivy2`). On first boot per workspace, the plugin
-warms them by `rsync`-copying from the host's `~/.cache/coursier` and
-`~/.ivy2` (mounted read-only at `/mnt/host-cache/...`). The mounts are
-released via `post-up` hook once warmup completes — `virtiofsd` exits and
-the runtime sbt I/O lives entirely on `root.img`.
+(`~/.cache/coursier`, `~/.ivy2`). On `nixbox up` the plugin's `post-up`
+hook runs `nixbox scala-sbt warm-cache`, which streams the host's
+`~/.cache/coursier` and `~/.ivy2` over the SSH channel into the guest
+(idempotent — guarded by a sentinel inside each cache dir). Subsequent
+boots are no-ops. Runtime sbt I/O lives entirely on `root.img` and never
+crosses virtiofs (see
+[ADR-015](../../docs/decisions/015-no-virtiofs-hot-caches.md)).
 
 If the host paths don't exist, the warmup is skipped and the cache is
-populated by `sbt update` over the network. See
-[ADR-015](../../docs/decisions/015-no-virtiofs-hot-caches.md) for the
-rationale.
+populated by `sbt update` over the network. You can also re-run the
+command manually (`nixbox scala-sbt warm-cache`) to refresh after
+removing the sentinel files.
 
 ## Private repository credentials
 

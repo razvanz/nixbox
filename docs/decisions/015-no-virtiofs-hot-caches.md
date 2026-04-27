@@ -1,4 +1,4 @@
-# 015: No steady-state virtiofs for churning caches
+# 015: No virtiofs for churning caches
 
 **Date:** 2026-04-27
 **Status:** accepted
@@ -9,34 +9,25 @@
 
 ## Decision
 
-Plugins MUST NOT use virtiofs as the **steady-state runtime path** for churning data — package-manager caches, build-artifact caches, indexer state. Runtime cache I/O lives on `root.img`, which persists per workspace, at the tool's default location (or via env-var redirect from a setup script when the default is not under `$HOME`).
+Plugins MUST NOT virtiofs-mount churning data — package-manager caches, build-artifact caches, indexer state. Cache I/O lives on `root.img`, which persists per workspace, at the tool's default location (or via env-var redirect from a setup script when the default is not under `$HOME`).
+
+If the host has a useful warm cache to seed the guest with, plugins SHOULD deliver it via a host-side **plugin command** (`plugins/<name>/commands/<cmd>.sh`) invoked from a `post-up` hook. The command streams the cache into the guest over the existing SSH channel (e.g. `tar | nixbox run "tar -x"`) and writes a sentinel for idempotency. No virtiofs mount is involved.
 
 Use virtiofs only where in-place cross-boundary semantics matter (e.g. source trees).
 
-### Bootstrap exception
-
-A read-only virtiofs mount used for a one-shot copy into `root.img` during the setup script is permitted. The FD high-water mark is bounded by the file count copied (one-time peak), not by session length.
-
-Bootstrap mounts MUST:
-- Be `readonly = true`.
-- Mount at a side path (e.g. `/mnt/host-cache/coursier`), never at the tool's runtime cache location.
-- Be read by an idempotent setup script that writes a sentinel and skips re-runs.
-- Not be touched after warmup (no live host↔guest cache sharing).
-
-Bootstrap mounts SHOULD be released after warmup via a `post-up` hook (`nixbox unmount <path>` is idempotent and frees the virtiofsd FDs accumulated during the copy). **In-tree plugins MUST release.** Third-party plugins are encouraged to release but are not required to — the FD high-water from a single bootstrap is well under the 524288 ceiling.
-
 ## Rationale
 
-`virtiofsd --cache=auto` holds a backing-file FD per served file and never meaningfully drops them — the FD set grows monotonically with workload. A persistent mount of a churning cache fails on this alone; the constrained atomic-op semantics noted in ADR-001 are an aggravating secondary cost. Bootstrap mounts pay the FD cost once (bounded by file count), then go quiet.
+`virtiofsd --cache=auto` holds a backing-file FD per served file and never meaningfully drops them — the FD set grows monotonically with workload. A persistent mount of a churning cache fails on this alone; the constrained atomic-op semantics noted in ADR-001 are an aggravating secondary cost.
+
+A plugin command driven by `post-up` is the right primitive for one-shot host→guest data transfer: it runs host-side where the data is, has the same SSH channel `bin/nixbox` uses internally, and is also user-invocable for manual refreshes (mirroring the established `nixbox aws login` and `nixbox claude-code sync-config` patterns).
 
 ## Consequences
 
 - New plugins do not declare runtime mounts for cache paths. Defaults under `$HOME` work; non-`$HOME` defaults get an env-var redirect from `scripts/setup.sh` (plugins cannot inject `env`, per ADR-013).
-- Plugins MAY declare RO bootstrap mounts at side paths and rsync from them in setup.
-- Live host↔guest cache sharing is gone; first boot per workspace warms from host, subsequent boots use `root.img` directly.
-- `plugins/scala-sbt` adopts the bootstrap pattern: RO mounts at `/mnt/host-cache/{coursier,ivy2}`, rsynced into `~/.cache/coursier` and `~/.ivy2` on first boot, sentinel-guarded; mounts released via `post-up` hook. Adds `rsync` to its packages.
-- `nixbox unmount` is idempotent (no-op + log if the target is not mounted), so post-up hooks are safe to run unconditionally on every `up`.
+- Host→guest cache seeding lives in a plugin command, called from `hooks.post-up`. The command is responsible for idempotency.
+- Live host↔guest cache sharing is gone; the warmup snapshots host state at first boot, then guest and host diverge.
+- `plugins/scala-sbt`: warmup delivered by `nixbox scala-sbt warm-cache` (host-side `tar` piped into the guest). No virtiofs mounts at all in this plugin.
 
 ## Future work
 
-VM snapshotting would replace the bootstrap rsync with a pre-warmed image; tracked separately.
+VM snapshotting would replace the per-workspace warmup with a pre-warmed image; tracked separately.
