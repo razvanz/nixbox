@@ -31,4 +31,11 @@ in
     );
 
   scripts = [ ./scripts/setup.sh ];
+
+  # Release bootstrap mounts after warmup (ADR-015): drops the guest mount,
+  # detaches the virtio device, kills virtiofsd → frees its accumulated FDs.
+  hooks.post-up = [
+    "nixbox unmount /mnt/host-cache/coursier"
+    "nixbox unmount /mnt/host-cache/ivy2"
+  ];
 }

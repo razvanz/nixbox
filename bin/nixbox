@@ -595,7 +595,7 @@ do_unmount() {
         fi
     done
 
-    [ -z "$mount_idx" ] && die "No mount found for target '$target' on VM '$name'"
+    [ -z "$mount_idx" ] && { log_sub "No active mount at '$target' on VM '$name' (already released?)"; return 0; }
 
     ssh "${SSH_OPTS[@]}" ${VM_USER}@"$TAP_GUEST_IP" "sudo umount '$target'"
 
