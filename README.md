@@ -229,9 +229,9 @@ Authenticates via SSO, injects temporary credentials into the VM, and logs into 
 
 ### scala-sbt
 
-**Provides:** `sbt` + `scala` packages, Maven/SBT resolver domains.
+**Provides:** `sbt`, `scala`, `scala-cli` packages, Maven/SBT resolver domains, and `nixbox scala-sbt warm-cache` (auto-runs on `up`).
 
-The JDK is specified separately via `nix.packages` so you control the version. Set `MAVEN_REPO_HOST`, `MAVEN_REPO_USER`, and `MAVEN_REPO_PASSWORD` env vars to auto-generate `~/.sbt/1.0/credentials.sbt` for private repositories.
+The JDK is specified separately via `nix.packages` so you control the version. Set `MAVEN_REPO_HOST`, `MAVEN_REPO_USER`, and `MAVEN_REPO_PASSWORD` env vars to auto-generate `~/.sbt/1.0/credentials.sbt` for private repositories. Coursier and ivy2 caches live on `root.img` (per-workspace persistent), seeded from host on first boot — see [ADR 015](docs/decisions/015-no-virtiofs-hot-caches.md).
 
 **Example config:**
 
@@ -256,6 +256,7 @@ The JDK is specified separately via `nix.packages` so you control the version. S
 
 - **Concurrent VMs** — up to 64 concurrent VMs supported, each with per-VM network isolation via slot-based IP allocation.
 - **virtiofs + `O_TMPFILE`** — virtiofs does not support `O_TMPFILE`. Tools that hit this (e.g. Node.js/Claude Code) need tmpfs overlays on affected dirs — the `claude-code` plugin handles this automatically.
+- **No live host↔guest cache sharing** — package-manager caches (coursier, ivy2, etc.) live on `root.img` per workspace, not virtiofs-shared with host. In-tree plugins may seed from host on first boot (e.g. `nixbox scala-sbt warm-cache`); after that, host and guest diverge. See [ADR 015](docs/decisions/015-no-virtiofs-hot-caches.md).
 - **Claude Code conversations** — Claude Code stores conversations under `~/.claude/projects/` keyed by the workspace's absolute path. Since the workspace path differs between host and guest (e.g. `/home/you/workspace` vs `/home/vmuser/workspace`), conversations don't carry over between the two. Workaround: symlink the guest-side conversation directory to the host's.
 
 ## Acknowledgments
