@@ -12,16 +12,22 @@ Scala toolchain with optional private Maven/Nexus credentials.
 
 | Category | Details |
 |---|---|
-| **Packages** | `sbt`, `scala`, `scala-cli` |
+| **Packages** | `sbt`, `scala`, `scala-cli`, `rsync` |
 | **Domains** | `maven.org`, `scala-sbt.org`, plus `MAVEN_REPO_HOST` if set |
 
 ## Caches
 
 Coursier and ivy2 caches live on the guest's `root.img` at default paths
-(`~/.cache/coursier`, `~/.ivy2`). They persist across `up`/`down` for the same
-workspace but are **not** shared with the host (see
-[ADR-015](../../docs/decisions/015-no-virtiofs-hot-caches.md)). First
-`sbt update` per workspace re-downloads dependencies.
+(`~/.cache/coursier`, `~/.ivy2`). On first boot per workspace, the plugin
+warms them by `rsync`-copying from the host's `~/.cache/coursier` and
+`~/.ivy2` (mounted read-only at `/mnt/host-cache/...` for the boot, then
+idle). Subsequent boots skip the warmup; sbt's runtime I/O lives entirely
+on `root.img` and never crosses virtiofs.
+
+If the host paths don't exist, the warmup is skipped and the cache is
+populated by `sbt update` over the network. See
+[ADR-015](../../docs/decisions/015-no-virtiofs-hot-caches.md) for the
+rationale.
 
 ## Private repository credentials
 
