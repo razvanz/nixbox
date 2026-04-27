@@ -12,9 +12,16 @@ Scala toolchain with optional private Maven/Nexus credentials.
 
 | Category | Details |
 |---|---|
-| **Packages** | `sbt`, `scala` |
-| **Mounts** | `~/.cache/coursier`, `~/.ivy2` (only if they exist on host) |
+| **Packages** | `sbt`, `scala`, `scala-cli` |
 | **Domains** | `maven.org`, `scala-sbt.org`, plus `MAVEN_REPO_HOST` if set |
+
+## Caches
+
+Coursier and ivy2 caches live on the guest's `root.img` at default paths
+(`~/.cache/coursier`, `~/.ivy2`). They persist across `up`/`down` for the same
+workspace but are **not** shared with the host (see
+[ADR-015](../../docs/decisions/015-no-virtiofs-hot-caches.md)). First
+`sbt update` per workspace re-downloads dependencies.
 
 ## Private repository credentials
 

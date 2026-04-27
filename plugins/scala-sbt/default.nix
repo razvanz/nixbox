@@ -1,20 +1,9 @@
-let
-  home = builtins.getEnv "HOME";
-  mountIf = path: target:
-    if home != "" && builtins.pathExists (home + path)
-    then [ { source = "~" + path; inherit target; } ]
-    else [ ];
-in
 {
   nix.packages = [
     "sbt"
     "scala"
     "scala-cli"
   ];
-
-  mounts =
-    mountIf "/.cache/coursier" "~/.cache/coursier"
-    ++ mountIf "/.ivy2" "~/.ivy2";
 
   network.domains =
     [
