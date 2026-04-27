@@ -312,11 +312,13 @@ NFTEOF
 
     # Raise FD limit before launching virtiofsd and cloud-hypervisor (#18).
     raise_nofile 524288
+    local virtiofsd_bin
+    virtiofsd_bin=$(ensure_virtiofsd_cap)
 
     # --- Start virtiofsd for nix-store share (required by microvm config) ---
     log "==> Starting virtiofsd for nix-store..."
     local nix_store_sock="$run_dir/nixbox-virtiofs-nix-store.sock"
-    virtiofsd --socket-path="$nix_store_sock" --shared-dir="/nix/store" --sandbox=none --translate-uid="map:1000:$(id -u):1" --translate-gid="map:100:$(id -g):1" --cache=auto 2>"$run_dir/virtiofsd-nix-store.log" &
+    "$virtiofsd_bin" --socket-path="$nix_store_sock" --shared-dir="/nix/store" --sandbox=none --translate-uid="map:1000:$(id -u):1" --translate-gid="map:100:$(id -g):1" --cache=auto --inode-file-handles=mandatory 2>"$run_dir/virtiofsd-nix-store.log" &
     echo "$!" > "$state_dir/virtiofsd_nix_store_pid"
     for _ in $(seq 1 10); do [ -S "$nix_store_sock" ] && break; sleep 0.2; done
     [ -S "$nix_store_sock" ] || die "virtiofsd socket for nix-store did not appear"
@@ -334,7 +336,7 @@ NFTEOF
             [ ! -d "$src" ] && die "Mount source does not exist: $src"
 
             local virtiofs_sock="$run_dir/virtiofs-${i}.sock"
-            virtiofsd --socket-path="$virtiofs_sock" --shared-dir="$src" --sandbox=none --translate-uid="map:1000:$(id -u):1" --translate-gid="map:100:$(id -g):1" --cache=auto 2>"$run_dir/virtiofsd-${i}.log" &
+            "$virtiofsd_bin" --socket-path="$virtiofs_sock" --shared-dir="$src" --sandbox=none --translate-uid="map:1000:$(id -u):1" --translate-gid="map:100:$(id -g):1" --cache=auto --inode-file-handles=mandatory 2>"$run_dir/virtiofsd-${i}.log" &
             echo "$!" > "$state_dir/virtiofsd_${i}_pid"
             for _ in $(seq 1 10); do [ -S "$virtiofs_sock" ] && break; sleep 0.2; done
             [ -S "$virtiofs_sock" ] || die "virtiofsd socket did not appear for mount $i"
@@ -543,13 +545,16 @@ do_mount() {
 
     local virtiofs_sock="$run_dir/virtiofs-${mount_idx}.sock"
     raise_nofile 524288
-    virtiofsd \
+    local virtiofsd_bin
+    virtiofsd_bin=$(ensure_virtiofsd_cap)
+    "$virtiofsd_bin" \
         --socket-path="$virtiofs_sock" \
         --shared-dir="$MOUNT_SOURCE" \
         --sandbox=none \
         --translate-uid="map:1000:$(id -u):1" \
         --translate-gid="map:100:$(id -g):1" \
-        --cache=auto 2>"$run_dir/virtiofsd-${mount_idx}.log" &
+        --cache=auto \
+        --inode-file-handles=mandatory 2>"$run_dir/virtiofsd-${mount_idx}.log" &
     echo "$!" > "$state_dir/virtiofsd_${mount_idx}_pid"
 
     for _ in $(seq 1 10); do
@@ -870,6 +875,13 @@ cmd_doctor() {
     else
         log_sub "/dev/kvm: MISSING"
         errors=$((errors + 1))
+    fi
+
+    local virtiofsd_wrapper="${XDG_DATA_HOME:-$HOME/.local/share}/nixbox/bin/virtiofsd"
+    if [ -x "$virtiofsd_wrapper" ] && getcap "$virtiofsd_wrapper" 2>/dev/null | grep -q 'cap_dac_read_search'; then
+        log_sub "virtiofsd cap: OK ($virtiofsd_wrapper)"
+    else
+        log_sub "virtiofsd cap: NOT INSTALLED (will install on first 'nixbox up'; needs sudo)"
     fi
 
     echo ""

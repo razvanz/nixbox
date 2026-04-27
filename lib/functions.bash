@@ -45,6 +45,41 @@ raise_nofile() {
         || die "Failed to raise NOFILE soft limit to $target after raising hard limit"
 }
 
+# Resolves to a virtiofsd binary that has CAP_DAC_READ_SEARCH set, required for
+# --inode-file-handles=mandatory (#18). The capability cannot live on the
+# /nix/store path (read-only and GC-collectable), so a copy is kept under
+# $XDG_DATA_HOME/nixbox/bin and re-installed when the source binary changes
+# (e.g. after `nixbox update`). One sudo prompt per (re)install. Echoes the
+# wrapper path on stdout.
+ensure_virtiofsd_cap() {
+    local data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/nixbox"
+    local wrapper="$data_dir/bin/virtiofsd"
+    local marker="$data_dir/bin/.virtiofsd.src"
+
+    local src
+    src=$(command -v virtiofsd 2>/dev/null) \
+        || die "virtiofsd not found in PATH"
+    src=$(realpath "$src") \
+        || die "Failed to resolve realpath of virtiofsd"
+
+    if [ -x "$wrapper" ] \
+        && [ -f "$marker" ] \
+        && [ "$(cat "$marker")" = "$src" ] \
+        && getcap "$wrapper" 2>/dev/null | grep -q 'cap_dac_read_search'; then
+        echo "$wrapper"
+        return 0
+    fi
+
+    log "==> Installing setcap'd virtiofsd at $wrapper (requires sudo)..."
+    mkdir -p "$data_dir/bin"
+    cp -f "$src" "$wrapper" \
+        || die "Failed to copy virtiofsd to $wrapper"
+    sudo setcap cap_dac_read_search=ep "$wrapper" \
+        || die "Failed to set cap_dac_read_search on $wrapper. --inode-file-handles=mandatory cannot work without it."
+    echo "$src" > "$marker"
+    echo "$wrapper"
+}
+
 # ---------------------------------------------------------------------------
 # Network derivation (pure — depends only on slot + name)
 # ---------------------------------------------------------------------------

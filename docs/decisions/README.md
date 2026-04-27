@@ -23,3 +23,4 @@ Each file: `NNN-short-title.md` with sections **Problem**, **Decision**, **Conse
 | [011](011-guest-setup-scripts.md) | Guest setup via user-provided scripts | 2026-03-24 | accepted |
 | [012](012-per-workspace-nixbox-directory.md) | Per-workspace `.nixbox/` directory | 2026-03-24 | accepted |
 | [013](013-plugin-env-transparency.md) | Plugins must not inject env vars | 2026-03-24 | accepted |
+| [016](016-virtiofsd-file-handles-capability.md) | virtiofsd file-handle mode via setcap'd wrapper | 2026-04-27 | accepted |
