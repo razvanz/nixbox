@@ -658,7 +658,7 @@ do_list() {
 # ---------------------------------------------------------------------------
 
 ensure_setup() {
-    for cmd in nix jq dnsmasq nft mke2fs virtiofsd; do
+    for cmd in nix jq dnsmasq nft mke2fs virtiofsd setcap getcap; do
         command -v "$cmd" &>/dev/null || die "$cmd not found. Install it first."
     done
     [ -e /dev/kvm ] || die "/dev/kvm not found. KVM is required."
@@ -861,7 +861,7 @@ cmd_doctor() {
     local errors=0
 
     log "==> Checking prerequisites..."
-    for cmd in nix jq dnsmasq nft mke2fs virtiofsd; do
+    for cmd in nix jq dnsmasq nft mke2fs virtiofsd setcap getcap; do
         if command -v "$cmd" &>/dev/null; then
             log_sub "$cmd: OK"
         else

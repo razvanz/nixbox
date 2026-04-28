@@ -71,8 +71,11 @@ ensure_virtiofsd_cap() {
     fi
 
     log "==> Installing setcap'd virtiofsd at $wrapper (requires sudo)..." >&2
-    mkdir -p "$data_dir/bin"
-    cp -f "$src" "$wrapper" \
+    mkdir -p "$data_dir/bin" \
+        || die "Failed to create $data_dir/bin"
+    chmod 700 "$data_dir/bin" \
+        || die "Failed to chmod 700 $data_dir/bin"
+    cp --remove-destination "$src" "$wrapper" \
         || die "Failed to copy virtiofsd to $wrapper"
     sudo setcap cap_dac_read_search=ep "$wrapper" \
         || die "Failed to set cap_dac_read_search on $wrapper. --inode-file-handles=mandatory cannot work without it."
