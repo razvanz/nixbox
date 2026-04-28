@@ -70,7 +70,7 @@ ensure_virtiofsd_cap() {
         return 0
     fi
 
-    log "==> Installing setcap'd virtiofsd at $wrapper (requires sudo)..."
+    log "==> Installing setcap'd virtiofsd at $wrapper (requires sudo)..." >&2
     mkdir -p "$data_dir/bin"
     cp -f "$src" "$wrapper" \
         || die "Failed to copy virtiofsd to $wrapper"
