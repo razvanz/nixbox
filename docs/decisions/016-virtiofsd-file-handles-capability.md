@@ -20,6 +20,8 @@ Three privilege models were considered:
 
 Option 4. `lib/functions.bash::ensure_virtiofsd_cap` keeps a setcap'd copy of virtiofsd at `${XDG_DATA_HOME:-~/.local/share}/nixbox/bin/virtiofsd` and returns its path; `do_create` and `do_mount` invoke that path with `--inode-file-handles=mandatory`.
 
+`mandatory` over `prefer` because silent fallback to FD-mode would re-introduce the leak with no signal — the failure mode of #18 only surfaces after a long session, exactly the kind of degradation that hides until something OOMs.
+
 A copy under `$XDG_DATA_HOME` rather than `setcap` on the in-store binary, because the host is not NixOS: `/nix/store` is read-only and GC-collectable, `security.wrappers` doesn't apply, and host-package wrappers (`/usr/local/bin`) drift independently of the bundled CLI. A nixbox-managed copy is reinstalled automatically when the source binary realpath changes (e.g., after `nixbox update`), keyed by a sidecar marker file.
 
 `cmd_doctor` reports wrapper status; `nixbox up` triggers (re)install on demand. The first run prompts for sudo (one-time per virtiofsd version), parallel to the existing `sudo prlimit` path in `raise_nofile`.
@@ -27,7 +29,9 @@ A copy under `$XDG_DATA_HOME` rather than `setcap` on the in-store binary, becau
 ## Consequences
 
 - The FD ceiling is no longer a function of cache size. Source-tree shares are stable across long sessions.
+- **Memory replaces FDs as the long-run ceiling.** Each cached inode now holds an opaque handle in virtiofsd's address space instead of an O_PATH FD. Empirically, ~8 KB per `/nix/store` inode and ~60 KB per workspace inode of virtiofsd RSS. A 524k-inode cache is no longer hitting `RLIMIT_NOFILE`, but it is GBs of resident memory.
 - One additional sudo prompt on first `nixbox up` after install or after a virtiofsd version bump.
+- **`/proc/<virtiofsd-pid>/fd` is now root-owned.** File capabilities trigger `PR_SET_DUMPABLE=0`, so debugging tools (`lsof -p`, `ls /proc/<pid>/fd`) need sudo. They silently return empty results without it.
 - ADR-001 (sandbox=none) and ADR-002 (uid/gid translate) preserved unchanged.
 - The granted capability is scoped: `CAP_DAC_READ_SEARCH` bypasses DAC for read/search only, and only matters for paths the daemon already opens via `--shared-dir`. Other DAC checks remain.
 - Wrapper drift: invoking nixbox under a non-canonical PATH that resolves a different virtiofsd causes a reinstall. Acceptable — the CLI is a Nix wrapper with a deterministic PATH, so the canonical path is stable.
