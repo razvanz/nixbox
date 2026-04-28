@@ -12,7 +12,7 @@ ADR-015 keeps churning caches off virtiofs, but long-lived shares (source trees)
 Three privilege models were considered:
 
 1. **Run as root, `--sandbox=none`.** Rejected: with no sandbox there is no per-request `setresuid`, so guest-created files end up owned by root on the host filesystem. Regresses ADR-002.
-2. **Run as root, `--sandbox=namespace`.** Rejected explicitly by ADR-001 — credential switching breaks `O_CREAT|O_EXCL` (silent `EINVAL`) inside the guest.
+2. **Run as root, `--sandbox=namespace`.** Rejected: requires the daemon to run as root for one syscall path, and the interaction between namespace credential switching and `--translate-uid` is unverified — no upside over option 4, and any deviation regresses ADR-002. (ADR-001 only proves the *non-root* failure mode, so it doesn't apply here.)
 3. **Run as root, `--sandbox=chroot`.** Same root-EUID-on-create problem as option 1.
 4. **Grant only `CAP_DAC_READ_SEARCH` on the binary.** Daemon stays at UID 1000; ADR-001 and ADR-002 hold; only the one capability needed by `name_to_handle_at(2)` is added.
 
