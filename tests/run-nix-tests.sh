@@ -83,6 +83,16 @@ assert_eq "user domain" "$(jq_get "$json" '.network.domains | index("user.exampl
 assert_eq "plugin hook" "$(jq_get "$json" '.hooks."post-up"[0]')" "echo plugin-loaded"
 
 # ---------------------------------------------------------------------------
+echo "==> Test: parameterized plugin (function with args)"
+json=$(resolve "$FIXTURES/with_plugin_args.nix")
+
+assert_eq "projectName" "$(jq_get "$json" '.projectName')" "test-plugin-args"
+assert_eq "plugin env passed through" "$(jq_get "$json" '.env.GREETING')" "world"
+assert_eq "plugin packages" "$(jq_get "$json" '.nix.packages | index("curl") != null')" "true"
+assert_eq "plugin domain" "$(jq_get "$json" '.network.domains | index("fn.example.com") != null')" "true"
+assert_eq "user domain" "$(jq_get "$json" '.network.domains | index("user.example.com") != null')" "true"
+
+# ---------------------------------------------------------------------------
 echo "==> Test: empty mounts get default"
 json=$(resolve "$FIXTURES/empty_mounts.nix")
 

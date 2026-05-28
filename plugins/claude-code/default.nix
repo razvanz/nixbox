@@ -1,9 +1,10 @@
+{ configDir ? "~/.claude" }:
 {
   nix.packages = [ "claude-code" ];
 
   mounts = [
     {
-      source = "~/.claude";
+      source = configDir;
       target = "~/.claude";
     }
   ];

@@ -48,7 +48,8 @@ let
 
   # --- Plugin resolution ---
 
-  resolvePlugin =
+  # Import plugin source by path or name string
+  importPlugin =
     ref:
     if builtins.isPath ref then
       import ref
@@ -56,6 +57,24 @@ let
       import (builtins.toPath ref)
     else
       import (pluginsDir + "/${ref}");
+
+  # Call a plugin function with args, or return plain attrset as-is
+  callPlugin = imported: args: if builtins.isFunction imported then imported args else imported;
+
+  # Resolve a plugin reference:
+  #   "claude-code"                                     → import + call with {}
+  #   { plugin = "claude-code"; configDir = "~/.x"; }   → import + call with { configDir = "~/.x"; }
+  #   /path/to/plugin.nix                               → import + call with {}
+  resolvePlugin =
+    ref:
+    if builtins.isAttrs ref then
+      let
+        imported = importPlugin (ref.plugin or (throw "plugin attr requires a 'plugin' key"));
+        args = builtins.removeAttrs ref [ "plugin" ];
+      in
+      callPlugin imported args
+    else
+      callPlugin (importPlugin ref) { };
 
   pluginConfigs = map resolvePlugin (config.plugins or [ ]);
 
