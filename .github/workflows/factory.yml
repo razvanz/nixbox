@@ -1,0 +1,55 @@
+name: factory
+
+# Starts the factory for one groomed task spec. The stage graph lives in razvanz/factory.
+on:
+  push:
+    branches: [main]
+    paths: ["specs/*.md"]
+  workflow_dispatch:
+    inputs:
+      spec_path:
+        description: Path of a merged spec, for example specs/0001-example.md
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  find-spec:
+    runs-on: ubuntu-latest
+    outputs:
+      spec_path: ${{ steps.s.outputs.spec_path }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: s
+        env:
+          INPUT: ${{ inputs.spec_path }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [[ -n "${INPUT}" ]]; then
+            path=${INPUT}
+          else
+            base=${BEFORE}
+            [[ -z "${base}" || "${base}" =~ ^0+$ ]] && base="${AFTER}~1"
+            # TODO: one spec per push; a push that adds several specs runs only the first
+            path=$(git -c core.quotePath=false diff --name-only --diff-filter=A "${base}" "${AFTER}" -- 'specs/*.md' | head -1)
+          fi
+          if [[ -z "${path}" ]]; then
+            echo "::notice::No added spec in this push. Edited or deleted specs do not start the factory."
+          fi
+          echo "spec_path=${path}" >> "$GITHUB_OUTPUT"
+
+  ship:
+    needs: find-spec
+    if: needs.find-spec.outputs.spec_path != ''
+    uses: razvanz/factory/.github/workflows/ship.yml@main
+    with:
+      spec_path: ${{ needs.find-spec.outputs.spec_path }}
+      factory_ref: main
+    secrets:
+      claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
