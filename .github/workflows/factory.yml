@@ -1,0 +1,31 @@
+name: factory
+
+# Starts the razvanz/factory stage graph for one groomed issue.
+# The repo owner applies the factory:ready label when the issue is groomed.
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Number of a groomed issue
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  ship:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.label.name == 'factory:ready' && github.event.sender.login == github.repository_owner)
+    uses: razvanz/factory/.github/workflows/ship.yml@main
+    with:
+      issue_number: ${{ github.event.issue.number || inputs.issue_number }}
+      factory_ref: main
+    secrets:
+      claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
